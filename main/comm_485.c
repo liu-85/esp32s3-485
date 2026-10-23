@@ -1312,19 +1312,37 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
 static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
 {
     /* 进料（send_out）：Tianshu 判据 flags=0x03 && motion=0x00。
-     *   全局"进料但未点名"(slot=0xFF)：若当前通道在 before_pull_back 或
-     *   stop_on_use，就正式退料；否则不动作（等点名帧）。
+     *   全局"进料但未点名"(slot=0xFF)：**只有当前通道已在 before_pull_back
+     *   时才转正式退料**；其它状态一律不动作（等点名帧）。
      *
-     *   ★ 0.29.5（用户第 3 条）：这里"从停止/准备态转 PULL_BACK 并反转"是
-     *   Tianshu 的正式退料语义（send_out 全局帧 + 当前已在退料侧 → 执行
-     *   pull_back）。但因 0.29.5 已收紧门控——只有 Cxx 携带明确运动意图的
-     *   帧才进状态机、Dxx 查询帧(0x01/0x00)不进——所以这条路径现在只在
-     *   "打印机真发 Cxx 0x03/0x00"时触发，查询帧不再误打。保留不动，
-     *   避免修完反复进退后变成"无法退料"（用户第 3 条的提醒）。 */
+     * ★★★ 0.29.7 决定性修正（现场：A1 通道进料到位后挤出机刚拉到料就退料、
+     *     如此循环不复）★★★
+     *
+     *   0.29.5/0.29.6 这里多了一条 `MOT_STOP_ON_USE → MOT_PULL_BACK`：只要
+     *   通道处于「到位停止(stop_on_use)」时收到全局 0x03/0x00，就**立刻反转
+     *   退料**。而现场这台 A1 的节拍正是「进料 → 到位(0x0E/0xFF / 0x07/0x00)
+     *   → 全局 0x03/0x00」，于是：
+     *
+     *     挤出机正转把料拉进热端 → 我方收到全局 0x03/0x00 → 立刻反转退料
+     *     → 料被从挤出机里拽出来（"没有挤出、只拉一点就退"）→ 打印机重试
+     *     → 再进料再退料 …… 无限循环。
+     *
+     *   对照 Tianshu src/BambuBus.cpp 的 send_for_Dxx()（唯一在 A1+1.7.0 实测
+     *   可用的实现）：
+     *       else if (read_num == 0xFF && statu_flags == 0x03 && motion == 0x00) {
+     *           if (motion == before_pull_back)      // ★ 只认 before_pull_back
+     *               set_motion_internal(..., pull_back);
+     *       }
+     *   它**从不**把 stop_on_use 当退料 —— 对 Tianshu 来说，"到位"绝不是
+     *   "退料"的触发条件，退料必须由打印机显式发 before_pull_back(0x09/0x3F)
+     *   先立好状态，再由这条全局帧"确认执行"。
+     *
+     *   所以这里删掉 stop_on_use 分支：到位后我方只保持"停止 + 断离合 + 交还
+     *   控制权"，绝不主动反转。退料仍由 0x09/0x3F → before_pull_back → 本分支
+     *   的 pull_back 正常触发，不会变成"无法退料"。 */
     if (flags == 0x03 && motion == 0x00) {
         if (s_now_mot_ch >= 0 &&
-            (s_mot[s_now_mot_ch] == MOT_BEFORE_PULL_BACK ||
-             s_mot[s_now_mot_ch] == MOT_STOP_ON_USE)) {
+            s_mot[s_now_mot_ch] == MOT_BEFORE_PULL_BACK) {
             int ch = (int)s_now_mot_ch;
             if (mot_set(ch, MOT_PULL_BACK, now_us)) {
                 mot_apply(ch);
@@ -1334,9 +1352,20 @@ static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
     }
 
     /* 退料（before_pull_back）：Tianshu 判据 flags=0x09 && motion=0x3F。
-     *   当前通道在 on_use 时转 before_pull_back；其它不动作。 */
+     *   全局帧（slot=0xFF）也允许"当前通道"转 before_pull_back。
+     *
+     *   ★ 0.29.7：来源状态与**点名帧的分支（mot_step_channel 的 is_before_pullb）
+     *   保持同一套判据** —— on_use / before_on_use / stop_on_use 都能转退料。
+     *
+     *   原来这里只认 MOT_ON_USE。但本机到位后停在 stop_on_use，若打印机用
+     *   全局帧发"准备退料"，旧代码会漏掉 → 配上 0.29.7 删掉 stop_on_use 的
+     *   自动退料后，就会出现"到位后退不了料"。放宽后与 Tianshu 一致：
+     *   退料永远由打印机的 0x09/0x3F 显式发起，我方只是把状态跟上。 */
     if (flags == 0x09 && motion == 0x3F) {
-        if (s_now_mot_ch >= 0 && s_mot[s_now_mot_ch] == MOT_ON_USE) {
+        if (s_now_mot_ch >= 0 &&
+            (s_mot[s_now_mot_ch] == MOT_ON_USE ||
+             s_mot[s_now_mot_ch] == MOT_BEFORE_ON_USE ||
+             s_mot[s_now_mot_ch] == MOT_STOP_ON_USE)) {
             int ch = (int)s_now_mot_ch;
             if (mot_set(ch, MOT_BEFORE_PULL_BACK, now_us)) {
                 mot_apply(ch);
