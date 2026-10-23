@@ -32,4 +32,4 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 #   · 「自吸上料」整套删除（第三只微动、AUTOLOAD 命令/状态、网页入口、
 #     配置掩码）；掩码那一字节改名保留占位，配置长度不变、不清用户数据
 # ---------------------------------------------------------------------------
-project(esp-ams-s3 VERSION 0.28.0)
+project(esp-ams-s3 VERSION 0.29.0)

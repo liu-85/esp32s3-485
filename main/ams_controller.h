@@ -173,6 +173,7 @@ esp_err_t ams_start(void);
  */
 esp_err_t ams_connect_printer(void);
 
+
 /* ==========================================================================
  * 投递命令（线程安全，可以从 Web / MQTT / 任意任务调用）
  * ========================================================================== */
@@ -215,6 +216,22 @@ bool ams_post_retract(int material_index);
  * @param direction      1 = 进料（正转）；-1 = 退料（反转）
  */
 bool ams_post_485_drive(int material_index, int direction);
+
+/**
+ * 485 进料「到位立即停」后的双微动决策层入口。
+ *
+ * ★★ 2026-10-24 用户拍板：到位(0x07/0x00 stop_on_use)立即停电机后，
+ *   靠该通道两只微动（常开 4.7k 开始位 + 常闭 10k 停止位，ADC 三态）
+ *   决定「续送 / 断料」：停止微动触发 = 料已咬稳 → 保持断料；
+ *   开始微动触发 = 余料要补 → 短促续送一段再复查停止微动；
+ *   6s 无微动响应 → 超时断离合回 idle。
+ *
+ * 由 comm_485.c 在状态机转入 MOT_STOP_ON_USE 时调用。决策本身在 ams_task
+ * 主循环里轮询（poll_485_decide），这里只负责"开窗"。
+ *
+ * @param ch 料盘位下标（0 起）
+ */
+void ams_485_enter_decide_window(int ch);
 
 /** 便捷封装：换料到指定打印机通道（1 起） */
 bool ams_post_exchange(int printer_channel);

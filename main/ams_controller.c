@@ -195,6 +195,101 @@ static uint32_t s_led_tick;
 static uint32_t s_last_start_seq[BOARD_CHANNEL_COUNT];
 
 /* ==========================================================================
+ * ★★ 2026-10-24 用户拍板：485 进料「到位立即停」后的双微动决策层 ★★
+ *
+ *   打印机 send_out(0x03/0x00) → 我方进料 → 打印机 stop_on_use(0x07/0x00)
+ *   到位 → ams_post_stop() 立即停电机 + 断离合。
+ *
+ *   但「到位」只说明料被 AMS 推到热端咬合，**未必咬稳**。用户要求：到位后
+ *   靠该通道的两只微动（常开 4.7k 开始位 + 常闭 10k 停止位，串联走 ADC）
+ *   决定「续送 / 断料」：
+ *
+ *       到位瞬间（stop_on_use）进入 s_485_decide_ch = ch 的窗口期
+ *         ┌ 停止微动触发（STOP，料已咬进挤出机）→ 保持断料，窗口结束
+ *         ├ 开始微动触发（START，料没咬稳 / 余料要补）→ 短促续送一段
+ *         │   直到停止微动再触发，才收手断离合
+ *         └ 窗口超时（默认 6s，料根本没动）→ 超时断离合，回到 idle
+ *
+ *   这层跑在 ams_task 主循环（不阻塞 485 状态机，不阻塞打印机节奏），
+ *   续送段用 motor_set_dir_speed(FEED, 90) 短脉冲（每次 ~400ms）+ 立即
+ *   复查停止微动，避免把料顶过头。
+ * ========================================================================== */
+#define AMS_485_DECIDE_TIMEOUT_MS  6000   /* 到位后决策窗口总长 */
+#define AMS_485_DECIDE_CREEP_MS    400    /* 单次续送脉冲时长 */
+
+static int      s_485_decide_ch   = -1;   /* 待决策通道；-1 = 无 */
+static uint32_t s_485_decide_us   = 0;    /* 进入决策窗口的时刻 */
+static uint32_t s_485_creek_us    = 0;    /* 上一次续送脉冲的时刻 */
+
+/**
+ * 由 485 状态机在 stop_on_use 到位时调用（comm_485.c 的 mot_apply
+ * 通过 ams_post_stop() 之外再显式调本函数，或直接由 ams_task 轮询）。
+ * 这里做成"被动"：comm_485.c 在转 MOT_STOP_ON_USE 时调用。
+ */
+void ams_485_enter_decide_window(int ch)
+{
+    s_485_decide_ch = ch;
+    s_485_decide_us = (uint32_t)(esp_timer_get_time() / 1000);
+    s_485_creek_us  = 0;
+}
+
+/** 485 决策层主循环（ams_task 每拍调用，非阻塞） */
+static void poll_485_decide(void)
+{
+    int ch = s_485_decide_ch;
+    if (ch < 0) {
+        return;
+    }
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t since  = now_ms - s_485_decide_us;
+
+    /* 窗口超时 → 放弃决策，回到纯 idle */
+    if (since >= AMS_485_DECIDE_TIMEOUT_MS) {
+        ams_log("485 决策：通道%d 到位后 %u ms 内微动无响应 → 断离合回空闲",
+                ch + 1, since);
+        s_485_decide_ch = -1;
+        /* 超时收手：若离合还吸着（续送中断开）则统一断 */
+        motor_stop();
+        clutch_release_all();
+        return;
+    }
+
+    /* 1. 停止微动触发 → 料已咬稳，保持断料 */
+    if (sensor_triggered(ch, SENSOR_STOP)) {
+        ams_log("485 决策：通道%d 停止微动触发 → 料已咬稳，保持断料", ch + 1);
+        s_485_decide_ch = -1;
+        return;
+    }
+
+    /* 2. 开始微动触发（缓冲器空，余料要补）→ 短促续送一段 */
+    if (sensor_triggered(ch, SENSOR_START)) {
+        /* 每 600ms 才允许一次续送，避免连续顶料 */
+        if (since - s_485_creek_us >= 600) {
+            ams_log("485 决策：通道%d 开始微动触发 → 续送 %d ms（PWM 90%%）",
+                    ch + 1, AMS_485_DECIDE_CREEP_MS);
+            motor_set_dir_speed(MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+            vTaskDelay(pdMS_TO_TICKS(AMS_485_DECIDE_CREEP_MS));
+            /* 续送完立即查停止微动：触发了就停，没触发保持离合等下一拍 */
+            s_485_creek_us = now_ms;
+            if (sensor_triggered(ch, SENSOR_STOP)) {
+                ams_log("485 决策：通道%d 续送后停止微动触发 → 收手断离合", ch + 1);
+                s_485_decide_ch = -1;
+                motor_stop();
+                clutch_release_all();
+            } else {
+                /* 没到停止位 → 电机停但离合保持吸合，等下一次开始微动再续 */
+                motor_stop();
+            }
+        }
+        return;
+    }
+
+    /* 3. 两只微动都没触发（中间态）→ 保持当前：离合已吸、电机停，等下一拍 */
+}
+
+
+/* ==========================================================================
  * 一、状态读写
  * ========================================================================== */
 
@@ -1380,6 +1475,11 @@ static bool do_retract(int material_index)
  * clutch_engage() 把离合咬住，让电机**持续转**，直到打印机发「到位/停止」
  * 指令 → ams_post_stop() 收掉。这样电机完全跟随打印机的 485 节奏。
  *
+ * ★★ 2026-10-24 用户拍板：进料占空比 100 → 90 ★★
+ *   现场反馈"PWM 值太低还是蠕动送料" —— 满速 255 占空比下 DRV8833 的
+ *   电流采样 + 死区时序会让电机在低负载段出现微停/蠕动，90% 占空比
+ *   （duty=229）落在电机额定工作区间，送料顺滑。退料仍用满速。
+ *
  * @param material_index 料盘位下标（0 起）
  * @param direction      1 = 进料（正转）；-1 = 退料（反转）
  */
@@ -1399,14 +1499,14 @@ static void do_485_drive(int material_index, int direction)
     }
     clutch_set_busy(true);
 
-    /* 方向转成 motor_dir_t（±1），再用非阻塞接口启动 —— 电机持续转，
-     * 直到 ams_post_stop() 被打印机「到位/停止」指令触发。 */
+    /* ★★ 2026-10-24：进料 90%（消除蠕动），退料满速 ★★ */
     motor_dir_t dir = (direction < 0) ? MOTOR_DIR_RETRACT : MOTOR_DIR_FEED;
-    motor_set_dir_speed(dir, MOTOR_SPEED_FULL);
+    int speed_pct = (direction < 0) ? MOTOR_SPEED_FULL : MOTOR_SPEED_485_FEED;
+    motor_set_dir_speed(dir, speed_pct);
 
     set_state(AMS_STATE_LOAD, material_index);
-    ams_log("485 驱动：料盘位%d %s（非阻塞，等待打印机的到位/停止指令）",
-            material_index + 1, direction < 0 ? "退料" : "进料");
+    ams_log("485 驱动：料盘位%d %s（PWM %d%%，非阻塞，等待打印机的到位/停止指令）",
+            material_index + 1, direction < 0 ? "退料" : "进料", speed_pct);
 }
 
 
@@ -3623,6 +3723,9 @@ static void ams_task(void *arg)
 
         /* ---- ④ 微动触发的自动动作 ---- */
         poll_trigger_switches();
+
+        /* ---- ④' 485 进料到位后的双微动决策（续送 / 断料） ---- */
+        poll_485_decide();
 
         /* ---- ⑤ 状态灯 ---- */
         led_update();

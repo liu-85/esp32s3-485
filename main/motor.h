@@ -45,6 +45,12 @@ extern "C" {
 /** 全速（百分比）。LEDC 的 8 位分辨率（0~255）由 motor.c 内部换算，这里只表示"百分之百" */
 #define MOTOR_SPEED_FULL 100
 
+/** ★★ 2026-10-24 用户拍板：485 进料占空比 90% ★★
+ *   现场反馈满速（255 占空比）下 DRV8833 在低负载段微停/蠕动。
+ *   485 进料（send_out）专门走 90%（duty≈229）；退料仍用满速。
+ *   仅 ams_controller.c 的 do_485_drive() 引用，其他路径不受影响。 */
+#define MOTOR_SPEED_485_FEED 90
+
 /** 方向。数值直接乘在 PWM 上，所以必须是 ±1 / 0。 */
 typedef enum {
     MOTOR_DIR_RETRACT = -1,  /**< 退料（反转） */
