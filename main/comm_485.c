@@ -1262,9 +1262,20 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
 /* 槽号 = 0xFF（打印机没点名）→ 全局状态机 */
 static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
 {
-    /* ★ 全局"空闲"信号：flags=0x01 && motion=0x00（site 实证的全局 idle 轮询）
-     *   → 所有通道回 idle。放在最前，避免被下面的 0x01 运动放宽误判。 */
+    /* ★★ 2026-10-24 0.29.1 修正：全局 idle 轮询一律回 idle，绝不触发动作 ★★
+     *
+     *   现场 0.29.0 实证：选 AMS-A 后打印机**全程只发 slot=0xFF 的全局帧**
+     *   （flags=0x01 motion=0x00），从不点名 A1 通道。0.29.0 把 flags=0x01
+     *   放宽成进料判据后，这条全局 idle 轮询被当成"进料"接住 → 但全局
+     *   路径没有通道上下文，走的是"停机"分支 → 电机立刻被 ams_post_stop()
+     *   收掉 → 挤出机拉到一点没压力 → 报挤出失败。
+     *
+     *   现在：全局 0x01/0x00 = 纯 idle，一律让通道回 idle、断离合，**不触发
+     *   任何进料/退料动作**。真正的进料靠"点名槽"(slot < AMS_SLOTS) 的
+     *   0x01/0x00 放宽（见 mot_step_channel），那条路径有明确通道号才能驱动。
+     *   退料意图（0x09/0x01 + 0x3F）仍按 Tianshu/放宽判据接住。 */
     if (flags == 0x01 && motion == 0x00) {
+        /* 全局空闲轮询：所有非运动通道回 idle，不动作 */
         bool any = false;
         for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
             any = mot_set(i, MOT_IDLE, now_us) || any;
@@ -1279,31 +1290,12 @@ static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
     }
 
     /* ★ 退料（before_pull_back）：Tianshu 判据 flags=0x09 && motion=0x3F，
-     *   ★★ 2026-10-24 用户拍板放宽 ★★ 现场 flags 恒 0x01，退料意图同放宽到 0x01。 */
+     *   放宽现场 flags=0x01。点名退料走 channel 路径；全局退料（没点名）
+     *   只在当前通道 on_use 时转 before_pull_back。 */
     if (((flags == 0x09) || (flags == 0x01)) && motion == 0x3F) {
         if (s_now_mot_ch >= 0 && s_mot[s_now_mot_ch] == MOT_ON_USE) {
             int ch = (int)s_now_mot_ch;
             if (mot_set(ch, MOT_BEFORE_PULL_BACK, now_us)) {
-                mot_apply(ch);
-            }
-        }
-        return;
-    }
-
-    /* ★ 进料（send_out）全局：Tianshu 判据 flags=0x03 && motion=0x00，
-     *   ★★ 2026-10-24 用户拍板放宽 ★★ 现场 flags 恒 0x01，进料意图同放宽。
-     *   "进料但未点名"的全局信号：
-     *     · 当前通道在"准备退料" → 正式退料
-     *     · 当前通道在"到位停止" → 直接退料（STOP 是明确到位态，不需 5s 闸门） */
-    if (((flags == 0x03) || (flags == 0x01)) && motion == 0x00) {
-        if (s_now_mot_ch >= 0 && s_mot[s_now_mot_ch] == MOT_BEFORE_PULL_BACK) {
-            int ch = (int)s_now_mot_ch;
-            if (mot_set(ch, MOT_PULL_BACK, now_us)) {
-                mot_apply(ch);
-            }
-        } else if (s_now_mot_ch >= 0 && s_mot[s_now_mot_ch] == MOT_STOP_ON_USE) {
-            int ch = (int)s_now_mot_ch;
-            if (mot_set(ch, MOT_PULL_BACK, now_us)) {
                 mot_apply(ch);
             }
         }
