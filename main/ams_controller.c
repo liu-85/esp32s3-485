@@ -217,32 +217,67 @@ static uint32_t s_last_start_seq[BOARD_CHANNEL_COUNT];
 #define AMS_485_DECIDE_TIMEOUT_MS  6000   /* 到位后决策窗口总长 */
 #define AMS_485_DECIDE_CREEP_MS    400    /* 单次续送脉冲时长 */
 
-static int      s_485_decide_ch   = -1;   /* 待决策通道；-1 = 无 */
-static uint32_t s_485_decide_us   = 0;    /* 进入决策窗口的时刻 */
-static uint32_t s_485_creek_us    = 0;    /* 上一次续送脉冲的时刻 */
+static int      s_485_decide_ch    = -1;   /* 待决策通道；-1 = 无 */
+static uint32_t s_485_decide_us    = 0;    /* 进入决策窗口的时刻 */
+static uint32_t s_485_creek_us     = 0;    /* 上一次续送脉冲的起始时刻 */
+static uint32_t s_485_creep_end_ms = 0;    /* 续送脉冲预计结束时刻；0 = 未在续送 */
 
 /**
- * 由 485 状态机在 stop_on_use 到位时调用（comm_485.c 的 mot_apply
- * 通过 ams_post_stop() 之外再显式调本函数，或直接由 ams_task 轮询）。
- * 这里做成"被动"：comm_485.c 在转 MOT_STOP_ON_USE 时调用。
+ * 由 485 状态机在 stop_on_use 到位时调用（comm_485.c 在转 MOT_STOP_ON_USE 时调用）。
  */
 void ams_485_enter_decide_window(int ch)
 {
-    s_485_decide_ch = ch;
-    s_485_decide_us = (uint32_t)(esp_timer_get_time() / 1000);
-    s_485_creek_us  = 0;
+    s_485_decide_ch    = ch;
+    s_485_decide_us    = (uint32_t)(esp_timer_get_time() / 1000);
+    s_485_creek_us     = 0;
+    s_485_creep_end_ms = 0;
 }
 
-/** 485 决策层主循环（ams_task 每拍调用，非阻塞） */
+/**
+ * ★★ 0.30.1：状态机离开 stop_on_use 时**必须**调用本函数取消续送窗口 ★★
+ *
+ *   现场：打印机在到位(stop_on_use)后**仅约 0.9 秒**就发 before_pull_back 退料，
+ *   而本决策窗口长达 6 秒。窗口不取消的话，退料期间 poll_485_decide() 仍可能
+ *   正转续送，与退料指令**方向相反**地互搏 —— 表现就是"到位后又反复进退料"。
+ *
+ *   comm_485.c 在 mot_set() 里、任何通道离开 MOT_STOP_ON_USE 时调用本函数。
+ *   这里只清标志、不碰硬件：调用方紧接着一定会投递新的电机指令（mot_apply），
+ *   由 ams_task 统一接管电机，避免跨任务操作电机。
+ */
+void ams_485_exit_decide_window(void)
+{
+    s_485_decide_ch    = -1;
+    s_485_creep_end_ms = 0;
+}
+
+/** 485 决策层主循环（ams_task 每拍调用，全程非阻塞） */
 static void poll_485_decide(void)
 {
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    /* 0. 续送脉冲到点收手 —— 放在窗口判断之前，保证残留脉冲一定被收掉。
+     *    ★ 0.30.1 由阻塞 vTaskDelay(400ms) 改为"记结束时刻"的非阻塞写法：
+     *      原来那 400ms 会把 ams_task 按住，队列里的 STOP/退料指令最多要
+     *      等 400ms 才执行 —— 这正是"上报到位后没有及时停止电机"。 */
+    if (s_485_creep_end_ms != 0 &&
+        (int32_t)(now_ms - s_485_creep_end_ms) >= 0) {
+        int c = s_485_decide_ch;
+        s_485_creep_end_ms = 0;
+        motor_stop();
+        if (c >= 0 && sensor_triggered(c, SENSOR_STOP)) {
+            ams_log("485 决策：通道%d 续送后停止微动触发 → 收手断离合", c + 1);
+            s_485_decide_ch = -1;
+            clutch_release_all();
+        }
+        return;
+    }
+
     int ch = s_485_decide_ch;
     if (ch < 0) {
         return;
     }
 
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    uint32_t since  = now_ms - s_485_decide_us;
+    uint32_t since = now_ms - s_485_decide_us;
 
     /* 窗口超时 → 放弃决策，回到纯 idle */
     if (since >= AMS_485_DECIDE_TIMEOUT_MS) {
@@ -262,26 +297,15 @@ static void poll_485_decide(void)
         return;
     }
 
-    /* 2. 开始微动触发（缓冲器空，余料要补）→ 短促续送一段 */
-    if (sensor_triggered(ch, SENSOR_START)) {
-        /* 每 600ms 才允许一次续送，避免连续顶料 */
-        if (since - s_485_creek_us >= 600) {
-            ams_log("485 决策：通道%d 开始微动触发 → 续送 %d ms（PWM 90%%）",
-                    ch + 1, AMS_485_DECIDE_CREEP_MS);
-            motor_set_dir_speed(MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
-            vTaskDelay(pdMS_TO_TICKS(AMS_485_DECIDE_CREEP_MS));
-            /* 续送完立即查停止微动：触发了就停，没触发保持离合等下一拍 */
-            s_485_creek_us = now_ms;
-            if (sensor_triggered(ch, SENSOR_STOP)) {
-                ams_log("485 决策：通道%d 续送后停止微动触发 → 收手断离合", ch + 1);
-                s_485_decide_ch = -1;
-                motor_stop();
-                clutch_release_all();
-            } else {
-                /* 没到停止位 → 电机停但离合保持吸合，等下一次开始微动再续 */
-                motor_stop();
-            }
-        }
+    /* 2. 开始微动触发（缓冲器空，余料要补）→ 短促续送一段（非阻塞） */
+    if (s_485_creep_end_ms == 0 &&
+        sensor_triggered(ch, SENSOR_START) &&
+        (since - s_485_creek_us >= 600)) {   /* 每 600ms 才允许一次，避免连续顶料 */
+        ams_log("485 决策：通道%d 开始微动触发 → 续送 %d ms（PWM 90%%）",
+                ch + 1, AMS_485_DECIDE_CREEP_MS);
+        motor_set_dir_speed(MOTOR_DIR_FEED, MOTOR_SPEED_485_FEED);
+        s_485_creek_us     = now_ms;
+        s_485_creep_end_ms = now_ms + AMS_485_DECIDE_CREEP_MS;
         return;
     }
 

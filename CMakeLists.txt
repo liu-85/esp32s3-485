@@ -31,5 +31,19 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 #     状态变化才投递物理动作；「485 运动执行」默认打开
 #   · 「自吸上料」整套删除（第三只微动、AUTOLOAD 命令/状态、网页入口、
 #     配置掩码）；掩码那一字节改名保留占位，配置长度不变、不清用户数据
+#
+# 0.30.1（2026-10-23）：
+#   · 照搬 Tianshu src/BambuBus.cpp 的运动状态机：7 态 / 单占用
+#     （get_loaded_filament 语义）/ accept 组合 / 送料先卸载本台其它 3 槽 /
+#     send_out→on_use 的 5 秒闸门 / on_use 期间 meters 按时间累加
+#   · 应答补真实 meters（Cxx 与 Dxx 都回累计米数）；use_flag 改为按台扫描
+#     （get_filament_use_flag 语义）；pressure / left_char 与 Tianshu 真值对齐
+#   · 帧类分发：Cxx(0x03) 与 Dxx(0x04) 各按自身字段布局驱动同一个状态机
+#     （现场 /bus485raw 实证：Cxx 携带运动意图，Dxx 恒为 0x01 查询帧 → 天然 no-op）
+#   · 修「到位后反复进退料」：状态机离开 stop_on_use 时取消本地续送窗口
+#     （ams_485_exit_decide_window）—— 打印机到位后仅约 0.9s 就发退料，而窗口
+#     有 6s，不关窗就会正转续送与退料方向互搏
+#   · 修「到位后没有及时停电机」：poll_485_decide 的续送由阻塞 400ms 改为
+#     非阻塞计时，不再卡住 ams_task、不再让 STOP/退料指令排队等待
 # ---------------------------------------------------------------------------
-project(esp-ams-s3 VERSION 0.29.6)
+project(esp-ams-s3 VERSION 0.30.1)

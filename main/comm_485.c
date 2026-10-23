@@ -168,6 +168,12 @@ static int8_t   s_now_mot_ch = -1;           /* 当前占用通道；-1 = 无 */
 static uint32_t s_sendout_us[BOARD_CHANNEL_COUNT];
 /* ★ 退料定长上限（Tianshu PULLBACK_TIMEOUT 语义，见 0.29.3 修退料过多）★ */
 static uint32_t s_pullback_us[BOARD_CHANNEL_COUNT];
+/* ★ 0.30.0：耗材累计（照搬 Tianshu BambuBus.cpp 的 _filament.meters /
+ *   _filament_ext.meters_virtual_count 语义）。on_use 期间按时间累加"已用
+ *   米数"，随 Cxx/Dxx 应答回给打印机；恒报 0 会和真机不一致。 */
+static float    s_meters[BOARD_CHANNEL_COUNT];
+static uint32_t s_meter_virt[BOARD_CHANNEL_COUNT];
+static uint32_t s_meter_last_ms[BOARD_CHANNEL_COUNT];
 /* 日志去重：只在"命令组合"变化时打一行（现场点一下进料就能看到唯一证据） */
 static uint8_t  s_noted_mot_ch = 0xFF;
 static uint8_t  s_noted_flags;
@@ -991,14 +997,23 @@ static void on_mc_online(uint16_t target, uint16_t my_addr, uint16_t pkg,
  *     left_char ← 每槽 2 bit：0b01 有料静止、0b11 有料且运动中
  */
 
-/* 有通道在送/退料 → 0x02；在 on_use 系 → 0x04；全空闲 → 0x00 */
-static uint8_t mot_use_flag(void)
+/* 台内某槽在送/退料 → 0x02；在 on_use 系 → 0x04；全空闲 → 0x00。
+ * ★ 0.30.0 照搬 Tianshu get_filament_use_flag(ams_num)：**只扫本台 4 槽**，
+ *   不再跨台扫描首条非 idle 通道。 */
+static uint8_t mot_use_flag(int unit)
 {
-    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
-        if (s_mot[i] == MOT_IDLE) {
+    if (unit < 0 || unit * AMS_SLOTS >= BOARD_CHANNEL_COUNT) {
+        return 0x00;
+    }
+    for (int i = 0; i < AMS_SLOTS; i++) {
+        int ch = unit * AMS_SLOTS + i;
+        if (ch >= BOARD_CHANNEL_COUNT) {
+            break;
+        }
+        if (s_mot[ch] == MOT_IDLE) {
             continue;
         }
-        if (s_mot[i] == MOT_SEND_OUT || s_mot[i] == MOT_PULL_BACK) {
+        if (s_mot[ch] == MOT_SEND_OUT || s_mot[ch] == MOT_PULL_BACK) {
             return 0x02;
         }
         return 0x04;
@@ -1077,6 +1092,14 @@ static bool mot_set(int ch, uint8_t new_mot, int64_t now_us)
     ams_log("485 运动：通道%d %s → %s", ch + 1,
             mot_name(s_mot[ch]), mot_name(new_mot));
     s_mot[ch] = new_mot;
+
+    /* ★ 0.30.1：离开「到位停止」时必须取消本地续送窗口。
+     *   否则打印机在到位后约 0.9 秒就发退料，而决策窗口有 6 秒 —— 退料
+     *   期间 poll_485_decide 仍会正转续送，与退料方向互搏，表现为"到位后
+     *   反复进退料"。这里只清窗口标志，电机由随后的 mot_apply 统一下令。 */
+    if (new_mot != MOT_STOP_ON_USE) {
+        ams_485_exit_decide_window();
+    }
     if (new_mot == MOT_SEND_OUT) {
         s_sendout_us[ch] = (uint32_t)(now_us / 1000);
     } else if (new_mot == MOT_PULL_BACK) {
@@ -1084,6 +1107,28 @@ static bool mot_set(int ch, uint8_t new_mot, int64_t now_us)
         s_pullback_us[ch] = (uint32_t)(now_us / 1000);
     }
     return true;
+}
+
+/* on_use 期间按时间累加"已用米数"（照搬 Tianshu：meters += dt/300000，
+ * dt 取本通道相邻两帧间隔，>1000ms 视为无效按 0 计）。 */
+static void mot_meters_accum(int ch, int64_t now_us)
+{
+    if (ch < 0 || ch >= BOARD_CHANNEL_COUNT) {
+        return;
+    }
+    if (s_meter_virt[ch] >= 10000) {           /* Tianshu 上限保护 */
+        return;
+    }
+    uint32_t now_ms = (uint32_t)(now_us / 1000);
+    if (s_meter_last_ms[ch] != 0) {
+        uint32_t dt = now_ms - s_meter_last_ms[ch];
+        if (dt > 1000) {
+            dt = 0;
+        }
+        s_meters[ch]     += (float)dt / 300000.0f;
+        s_meter_virt[ch] += dt;
+    }
+    s_meter_last_ms[ch] = now_ms;
 }
 
 /*
@@ -1182,94 +1227,103 @@ static void mot_apply(int ch)
     }
 }
 
-/* 打印机点名了某个槽 → 单通道状态机。返回 true = 状态变了 */
+/* ==========================================================================
+ * 单通道状态机（★ 0.30.0 照搬 Tianshu BambuBus.cpp process_motion_state_machine）
+ * ==========================================================================
+ *
+ *   判据、状态转移、单占用语义、5 秒闸门、meters 累加全部照 Tianshu 原样移植；
+ *   只保留两处**本项目适配**：
+ *     · 追加现场实测的 0x0F/0x0E 扩展 flags（A1 固件 1.7.0 到位后发的是扩展位）
+ *     · 进入 stop_on_use 时触发本项目「双微动决策开窗」ams_485_enter_decide_window
+ *
+ *   Tianshu 的核心差别（相对 0.29.x 的旧实现）：
+ *     · allow_any / allow_stop 用 **本台占用槽** 判定（get_loaded_filament 语义），
+ *       不再用全局 s_now_mot_ch 跨台比较 —— 占用通道在别的台时，本台视为空闲。
+ *     · accept 成立即"占用本通道"，并把上一个占用通道置 idle。
+ *     · send_out 会先卸载**本台其它 3 槽**（Tianshu 明确写了这一步）。
+ *     · stop_on_use 只允许从 on_use / before_on_use 转入（旧实现多接了 send_out）。
+ */
 static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_us)
 {
-    /* ★★ 2026-10-24 0.29.2 收窄回 Tianshu 判据（修复 0.29.1 抖动）★★
-     *
-     *   0.29.0/0.29.1 为接现场 flags=0x01 把进料/退料放宽到 0x01，结果打印机
-     *   交替发的 idle 轮询帧（flags=0x01/0x02）被当成进料/退料意图 →
-     *   刚 send_out 就被退料收尾打回 idle，反复循环 → 「一会进一会退」。
-     *
-     *   现场设备 /log 实证：真正触发进料的是 flags=0x03（Tianshu 原值），
-     *   flags=0x01 是 idle 轮询、不该触发动作。所以：
-     *     · is_send_out / is_before_pullb 收窄回 Tianshu 判据（0x03 / 0x09）
-     *     · 退料收尾边沿（下面）同时接住 0x09 和 0x01 —— idle 轮询本身就是
-     *       "退料结束、回空闲"的信号，让它正确收尾而不是空转。 */
+    if (ch < 0 || ch >= BOARD_CHANNEL_COUNT) {
+        return false;
+    }
+    const int unit = ch / AMS_SLOTS;
+    const int slot = ch % AMS_SLOTS;
+
     const bool is_send_out      = (flags == 0x03) && (motion == 0x00);
     const bool is_before_on_use = (flags == 0x09) && (motion == 0x7F || motion == 0xA5);
-    /* ★ 0.29.6：现场这台 A1 到位后发的是 0x0F/0x0E（扩展位），不是 Tianshu 的
-     *   0x07/0x7F(on_use) 和 0x07/0x00(stop_on_use)。按扩展位对齐：
-     *   · on_use 扩展 = 0x0F/0x00（到位随动，电机停、让挤出机自己拉料）
-     *   · stop_on_use 扩展 = 0x0E/0xFF（到位停止，触发双微动决策开窗）
-     *   保留 0x07 原判据兜底（老协议/不同打印机仍可能发 0x07 系）。 */
     const bool is_stop_on_use   = ((flags == 0x07) && (motion == 0x00)) ||
-                                   ((flags == 0x0E) && (motion == 0xFF));
+                                  ((flags == 0x0E) && (motion == 0xFF));  /* 扩展位 */
     const bool is_on_use        = ((flags == 0x07) && (motion == 0x7F)) ||
-                                   ((flags == 0x0F) && (motion == 0x00));
+                                  ((flags == 0x0F) && (motion == 0x00));  /* 扩展位 */
     const bool is_before_pullb  = (flags == 0x09) && (motion == 0x3F);
 
-    const bool allow_any  = (s_now_mot_ch < 0) || (s_now_mot_ch == ch);
-    const bool allow_stop = (s_now_mot_ch == ch);
+    /* 本台占用槽（照搬 Tianshu get_loaded_filament） */
+    const uint8_t loaded = (s_now_mot_ch >= 0 && (s_now_mot_ch / AMS_SLOTS) == unit)
+                           ? (uint8_t)(s_now_mot_ch % AMS_SLOTS) : 0xFF;
+    const bool allow_any  = (loaded == 0xFF) || (loaded == (uint8_t)slot);
+    const bool allow_stop = (loaded == (uint8_t)slot);
+
     bool changed = false;
 
-    /* ★ 退料结束边沿（0.29.4 收窄）：MOT_PULL_BACK 期间收到「没料」信号 →
-     *   立即停、回空闲。
-     *
-     *   判据从 0.29.2 的「flags==0x09 或 0x01（motion≠0x3F）」收窄为
-     *   「flags==0x09 && motion==0xFF」——只认 Tianshu 的「退料结束/没料」
-     *   收尾帧 (0x09/0xFF)。
-     *
-     *   ★ 根因（现场 0.29.3 实证，monitor 日志 20:40:01）：0.29.2/0.29.3 把
-     *   idle 轮询 (flags=0x01/0x02) 也算「退料结束」，导致 PULL_BACK 刚反转
-     *   退一点就被 0x01 打断 → 下一帧 0x03 又送 → 「反复进退料」。且打断
-     *   发生在 4s 定长自停 (poll_485_retract) 跑满之前，定长上限根本没机会
-     *   生效。改成只认 0x09/0xFF 收尾帧后，idle 轮询不再打断退料，退料能
-     *   跑满 RETRACT_TIMEOUT_MS(4s) 自停断离合。 */
+    /* 退料结束边沿（项目适配）：PULL_BACK 期间收到 0x09/0xFF「退料结束/无料」
+     * 收尾帧 → 立即停、回空闲。idle 轮询帧不再打断退料（否则退料跑不满定长）。 */
     if (s_mot[ch] == MOT_PULL_BACK && !is_send_out &&
-        (flags == 0x09) && (motion == 0xFF)) {
+        flags == 0x09 && motion == 0xFF) {
         if (mot_set(ch, MOT_IDLE, now_us)) {
-            if (config_get_485_actuate()) {
-                ams_post_stop();
-            }
             s_now_mot_ch = -1;
+            mot_apply(ch);
         }
         return true;
     }
 
-    if (is_send_out) {
-        /* 送料不受 allow_any 限制：允许打印机直接改到另一路去送 */
-        if (s_now_mot_ch >= 0 && s_now_mot_ch != ch) {
+    /* accept → 占用本通道；上一个占用通道（可能属其它台）置 idle（照搬 Tianshu） */
+    const bool accept = is_send_out ||
+                        (is_before_on_use && allow_any) ||
+                        (is_on_use && allow_any) ||
+                        (is_stop_on_use && allow_stop) ||
+                        (is_before_pullb && allow_stop);
+    if (accept && s_now_mot_ch != (int8_t)ch) {
+        if (s_now_mot_ch >= 0 && s_now_mot_ch < BOARD_CHANNEL_COUNT) {
             int prev = (int)s_now_mot_ch;
             if (mot_set(prev, MOT_IDLE, now_us)) {
-                if (config_get_485_actuate()) {
-                    ams_post_stop();
+                mot_apply(prev);
+            }
+        }
+        s_now_mot_ch = (int8_t)ch;
+    }
+
+    if (is_send_out) {
+        /* 送料：先卸载**本台其它 3 槽**（照搬 Tianshu），再转 send_out */
+        if (s_mot[ch] != MOT_SEND_OUT) {
+            for (int i = 0; i < AMS_SLOTS; i++) {
+                int oc = unit * AMS_SLOTS + i;
+                if (oc != ch && oc < BOARD_CHANNEL_COUNT && s_mot[oc] != MOT_IDLE) {
+                    if (mot_set(oc, MOT_IDLE, now_us)) {
+                        mot_apply(oc);
+                    }
                 }
             }
         }
-        s_now_mot_ch = (int8_t)ch;
         changed = mot_set(ch, MOT_SEND_OUT, now_us);
     } else if (is_before_on_use && allow_any) {
-        s_now_mot_ch = (int8_t)ch;
         changed = mot_set(ch, MOT_BEFORE_ON_USE, now_us);
     } else if (is_on_use && allow_any) {
-        /* ★ 正在 send_out 时先让它把料推够 5 秒再转 on_use ——
-         *   参考实现同样有这道 5 秒闸门，否则刚送一点点就被打断。 */
+        /* 5 秒闸门（照搬 Tianshu）：send_out 未满 5 秒先不转 on_use，
+         * 否则刚送一点点就被打断。 */
         if (s_mot[ch] == MOT_SEND_OUT) {
             uint32_t now_ms = (uint32_t)(now_us / 1000);
             if ((uint32_t)(now_ms - s_sendout_us[ch]) < 5000) {
-                s_now_mot_ch = (int8_t)ch;
                 return false;
             }
         }
-        s_now_mot_ch = (int8_t)ch;
         changed = mot_set(ch, MOT_ON_USE, now_us);
+        mot_meters_accum(ch, now_us);          /* 照搬 Tianshu：on_use 期间累计米数 */
     } else if (is_stop_on_use && allow_stop) {
-        /* ★ 到位指令：立即停，不再蠕动/尾拉。后续续送/断料由该通道
-         *   「开始/停止」双微动（常开 4.7k + 常闭 10k 串联）判定。
-         *   ★★ 2026-10-24 用户拍板：到位开窗，ams_task 轮询 poll_485_decide
-         *   按双微动决定续送（开始微动）或断料（停止微动），6s 超时收手。 */
-        if (s_mot[ch] == MOT_SEND_OUT || s_mot[ch] == MOT_BEFORE_ON_USE) {
+        /* 到位停止：只从 on_use / before_on_use 转入（照搬 Tianshu）。
+         * 转入后触发本项目「双微动决策开窗」。 */
+        if (s_mot[ch] == MOT_ON_USE || s_mot[ch] == MOT_BEFORE_ON_USE) {
             changed = mot_set(ch, MOT_STOP_ON_USE, now_us);
             if (changed && config_get_485_actuate()) {
                 ams_485_enter_decide_window(ch);
@@ -1493,88 +1547,40 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
     }
 
     /* ---- 状态机：先更新状态，再照新状态组应答，最后才真正驱动电机 ---- */
-    /* ★★★ 2026-10-23 决定性修正：状态机只在 Dxx(cmd=0x04) 跑，Cxx 只应答 ★★★
+    /* ★★★ 0.30.0：Cxx(0x03) 与 Dxx(0x04) **两者都驱动**状态机 ★★★
      *
-     *   Tianshu（github.com/hu504011383/Tianshu，唯一在 A1+1.7.0 实测多台可用的
-     *   实现）的 BambuBus_run()：
-     *       case BambuBus_package_filament_motion_short (Cxx cmd=0x03):
-     *           send_for_Cxx(buf, len);        // 只应答，不跑状态机
-     *       case BambuBus_package_filament_motion_long (Dxx cmd=0x04):
-     *           send_for_Dxx(buf, len);        // 才跑 process_motion_state_machine
+     *   Tianshu BambuBus_run() 的分发是「Dxx(0x04) 跑状态机、Cxx(0x03) 只应答」
+     *   —— 它的 send_for_Cxx 只从 Cxx 取 台号[5]+槽号[7]。但本项目两台 A1 的
+     *   /bus485raw 现场抓包（见上方字段说明）证明：**Cxx 才携带 进料/到位/退料
+     *   的 statu/motion 序列**，而 Dxx 的 statu 全程恒 0x01（仅是状态查询）。
+     *   两者冲突时以现场实测为准。
      *
-     *   现场抓包：打印机**成对**发 Cxx + Dxx（每帧 Cxx 后面紧跟一帧字段相同的 Dxx）。
-     *   两者都进状态机会导致同一个动作被处理两次，虽然 mot_set 的 changed 守卫能
-     *   消解"重复驱动"，但会引入 Cxx/Dxx 字段在边界时刻不一致时的竞态，表现就是
-     *   打印机「一会进料一会退料、犹豫不决」。
+     *   这里取"并集"：两种帧类各按**自己的字段布局**解析后驱动同一个状态机：
+     *     · cmd 0x03（Cxx 布局）：flags=f[off+1] slot=f[off+2] motion=f[off+3]
+     *     · cmd 0x04（Dxx 布局）：flags=f[off+1] motion=f[off+2] slot=f[off+4]
+     *   （两种布局已在函数开头按 cmd 分别解析进 flags/motion/slot。）
      *
-     *   0.21.0 曾因为"只让 Cxx 进状态机导致电机不停"而改成两者都进 —— 那是把
-     *   "只跑 Cxx"错当成了唯一选择。
-     *
-     * ★★★ 2026-10-24 用户拍板：Cxx(0x03) 与 Dxx(0x04) 都驱动状态机 ★★★
-     *
-     *   现场 /bus485raw 实测：打印机把「进料/退料」意图放在 Cxx(cmd=0x03) 里下发
-     *   （statu_flag 恒 0x01、motion_flag 在 0x00/0x3F 之间切换），Dxx(cmd=0x04)
-     *   只是空闲轮询、字段恒不变 —— 单跑 Dxx 时 Cxx 携带的运动意图被完全忽略，
-     *   状态机永停 MOT_IDLE，电机永远不动，打印机退回外挂 + 抖退。
-     *
-     *   打印机 Cxx/Dxx 成对发（同字段），若两者都进状态机会双触发。mot_set() 的
-     *   "同状态返回 false" 守卫天然消解重复驱动：Cxx 先到达时状态已变，Dxx 紧随
-     *   的相同字段不再产生 changed → 不会二次驱动电机。边界时刻字段不一致时
-     *   由 5 秒闸门（on_use 在 send_out 未满 5s 不转）+ allow_stop 兜底。
-     *   用户已确认采用"两者都进 + Cxx 判据"。
-     *
-     * ★★★ 2026-10-24 0.29.5 修正（用户指出的状态机冲突，对照 /bus485raw 实证）★★★
-     *
-     *   0.29.3 现场帧（复现"反复进退料"）证明 **Dxx(0x04) 会发查询帧
-     *   flags=0x01 / motion=0x00 / slot=0（状态查询）**，而 0.29.3 的
-     *   mot_step_channel 退料收尾边沿把 flags=0x01 误当「退料结束」→ 把
-     *   MOT_PULL_BACK 中途打回 idle → 打印机再发 0x03/0x00 又进 PULL_BACK
-     *   → 反复进退料。根因是「查询帧和运动指令混在一起进状态机」。
-     *
-     *   修法（用户第 1/2/3 条建议）：
-     *     ① 区分 Cxx / Dxx：只有 **Cxx(cmd=0x03) 携带明确运动意图的帧**
-     *        （进料 0x03/0x00、预送 0x09/0xA5、到位 0x07/0x7F、停 0x07/0x00、
-     *        准备退料 0x09/0x3F）才驱动状态机。
-     *     ② Dxx(0x04) **只走状态查询应答**（下面 cmd==0x04 分支），不进状态机。
-     *     ③ Cxx 的 idle 轮询帧（flags=0x01/0x02、motion=0x00）也不驱动 —— 它们
-     *        是打印机在没动作时的轮询，不是运动意图。
-     *   退料结束仍由 0x09/0xFF 收尾帧 + poll_485_retract() 的 4s 定长上限双保险，
-     *   查询帧再也不会打断退料。
-     */
+     *   安全性：任一路若解析出的组合不构成运动意图（例如现场 Dxx 恒
+     *   0x01/0x00），状态机内部所有 is_* 判据全部落空 → 天然 no-op；另一路
+     *   的真实意图照常生效。同一意图被重复喂入也无害（mot_set 同态返回 false）。
+     *   于是无论现场实际走哪类帧，都不会丢意图、也不会重复触发。 */
     const int64_t now_us = esp_timer_get_time();
-    /* 明确运动意图：Cxx 里真正要驱动电机的 flags/motion 组合（Tianshu 判据 +
-     * 现场 0.29.5 实证补 0x0F/0x0E 扩展位） */
-    const bool is_motion_intent =
-        (cmd == 0x03) && (
-            (flags == 0x03 && motion == 0x00) ||   /* send_out      进料 */
-            (flags == 0x09 && motion == 0xA5) ||   /* before_on_use 预送 */
-            (flags == 0x07 && motion == 0x7F) ||   /* on_use        到位随动 */
-            (flags == 0x07 && motion == 0x00) ||   /* stop_on_use   到位停止 */
-            (flags == 0x09 && motion == 0x3F) ||   /* before_pullb  准备退料 */
-            (flags == 0x09 && motion == 0xFF) ||   /* pull_back 收尾（退料结束/无料） */
-            /* ★ 0.29.6：现场这台 A1 到位后发 0x0F/0x0E（Tianshu 判据表未覆盖的
-             *   扩展 flags，高位 bit4/bit3 置 1，通常是"自动模式/带传感器"
-             *   新协议标记）。0.29.5 按 Tianshu 收紧门控把它们挡在门外 →
-             *   到位后电机停在原位不继续挤 → 打印机自动挤出"没动静"。
-             *   现按 on_use(0x0F)/stop_on_use(0x0E) 扩展位补进白名单。 */
-            (flags == 0x0F && motion == 0x00) ||   /* on_use 扩展   到位随动 */
-            (flags == 0x0E && motion == 0xFF) );   /* stop_on_use 扩展 到位停止 */
-    if (is_motion_intent && unit_ok) {
-        int ch = (int)ru * AMS_SLOTS + (int)((slot < AMS_SLOTS) ? slot : 0);
+    if ((cmd == 0x03 || cmd == 0x04) && unit_ok) {
         if (slot < AMS_SLOTS) {
-            mot_step_channel(ch, flags, motion, now_us);
+            mot_step_channel((int)ru * AMS_SLOTS + (int)slot, flags, motion, now_us);
         } else {
             mot_step_global(flags, motion, now_us);
         }
     }
-    /* ★ Dxx(cmd=0x04) 不驱动状态机：它下面只走应答（回 use_flag/pressure/left_char）。
-     *   0.29.3 反复进退料根因就是 Dxx 查询帧(0x01/0x00)进了状态机被误当退料结束。 */
 
     if (cmd == 0x04) {
         /* ---------- Dxx：60 字节，cmd 必须是 0x04 ---------- */
         const int ask = (slot < AMS_SLOTS) ? ((int)ru * AMS_SLOTS + (int)slot) : -1;
         const uint16_t pres = (ask >= 0) ? mot_pressure(ask) : 0xFFFF;
-        const uint8_t  uflag = (ask >= 0) ? mot_use_flag() : 0x00;
+        const uint8_t  uflag = (ask >= 0) ? mot_use_flag((int)ru) : 0x00;
+        /* ★ 0.30.0：真实耗材累计（照搬 Tianshu Dxx_res[21..24]=meters）。
+         *   全局帧（ask<0）沿用项目原来的 0.0f 兜底，不用 Tianshu 的 -1 哨兵。 */
+        const float meters = (ask >= 0) ? s_meters[ask] : 0.0f;
 
         s_dxx[1]  = (uint8_t)(0xC0 | ((s_pkg_num & 0x07) << 3));
         s_dxx[4]  = 0x04;                      /* ★ cmd 必须回 0x04 */
@@ -1587,6 +1593,7 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
         s_dxx[17] = ru;                        /* 台号（第二处） */
         s_dxx[19] = uflag;                     /* ★ 真实 use_flag，不是写死 0 */
         s_dxx[20] = (slot < AMS_SLOTS) ? slot : 0xFF;
+        memcpy(s_dxx + 21, &meters, sizeof(meters));   /* ★ 耗材累计米数 */
         s_dxx[25] = (uint8_t)(pres & 0xFF);    /* ★ 真实压力值，低字节在前 */
         s_dxx[26] = (uint8_t)(pres >> 8);
         s_dxx[41] = mot_left_char((int)ru);    /* ★ 运动中的槽报 0b11 */
@@ -1595,20 +1602,22 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
         /* ---------- Cxx：44 字节，cmd = 0x03（运动命令的应答）---------- */
         /* 字段照最新 BMCU bambubus_ams_motion_package_struct：
          *   [5]=ams_num [7]=filament_use_flag [8]=filament_channel
-         *   [13..14]=pressure [29]=filament_stu_flag(left_char) */
+         *   [9..12]=meters [13..14]=pressure [29]=filament_stu_flag(left_char) */
         uint8_t slot3 = slot;                   /* Cxx 的槽号已在解析里取到（[7]=channel） */
         int ask = (slot3 < AMS_SLOTS) ? ((int)ru * AMS_SLOTS + (int)slot3) : -1;
-        uint8_t flagx = mot_use_flag();
+        uint8_t flagx = mot_use_flag((int)ru);
         if (flagx == 0x00) {
             flagx = 0x02;                      /* ★ 空闲也要报 0x02（参考实现同样兜底） */
         }
         uint16_t pres = (ask >= 0) ? mot_pressure(ask) : 0xFFFF;
+        const float meters = (ask >= 0) ? s_meters[ask] : 0.0f;
 
         s_cxx[1]  = (uint8_t)(0xC0 | ((s_pkg_num & 0x07) << 3));
         s_cxx[4]  = 0x03;
         s_cxx[5]  = ru;                        /* ★ 台号 */
         s_cxx[7]  = flagx;
         s_cxx[8]  = (slot3 < AMS_SLOTS) ? slot3 : 0xFF;
+        memcpy(s_cxx + 9, &meters, sizeof(meters));    /* ★ 耗材累计米数 */
         s_cxx[13] = (uint8_t)(pres & 0xFF);
         s_cxx[14] = (uint8_t)(pres >> 8);
         s_cxx[29] = mot_left_char((int)ru);

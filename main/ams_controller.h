@@ -233,6 +233,17 @@ bool ams_post_485_drive(int material_index, int direction);
  */
 void ams_485_enter_decide_window(int ch);
 
+/**
+ * 关闭 485 到位决策窗口（0.30.1）。
+ *
+ * 状态机**离开** MOT_STOP_ON_USE 时必须调用：打印机在到位后约 0.9 秒就发
+ * before_pull_back 退料，而决策窗口有 6 秒，不关窗的话退料期间 poll_485_decide
+ * 还会正转续送，与退料指令方向相反地互搏（"到位后反复进退料"）。
+ *
+ * 由 comm_485.c 的 mot_set() 在通道离开 MOT_STOP_ON_USE 时调用。
+ */
+void ams_485_exit_decide_window(void);
+
 /** 便捷封装：换料到指定打印机通道（1 起） */
 bool ams_post_exchange(int printer_channel);
 
