@@ -1,0 +1,598 @@
+/* ===========================================================================
+   ESP-AMS-S3 配置界面样式
+   ===========================================================================
+   设计约束（都是从前一代网页上踩出来的）：
+
+   1. 手机上必须能用 —— 机器装在打印机旁边，用户是拿手机连过去操作的。
+      所有布局在 320px 宽下都不能横向滚动。
+
+   2. 深浅色都要看得清。用 CSS 变量集中管颜色，`prefers-color-scheme`
+      自动跟随系统，不用做手动开关（少一个状态就少一类 bug）。
+
+   3. 不要过渡动画堆砌。设备端 HTTP 响应有时要等两秒（比如扫 WiFi），
+      动画多了会让人觉得"卡住了"；宁可老老实实显示"扫描中…"。
+
+   4. 状态色语义固定：
+        绿 = 正常 / 已连接
+        橙 = 需要注意（未连接、值被夹住、降级模式）
+        红 = 出错（离合冲突、引脚自检不过、升级失败）
+   =========================================================================== */
+
+:root {
+    --bg: #f4f6f9;
+    --panel: #ffffff;
+    --panel-2: #f8fafc;
+    --border: #e3e8ef;
+    --text: #1f2937;
+    --text-dim: #6b7280;
+    --text-faint: #9ca3af;
+
+    --brand: #2f6fed;
+    --brand-dim: #eaf1fe;
+    --ok: #16a34a;
+    --ok-dim: #e8f7ee;
+    --warn: #d97706;
+    --warn-dim: #fdf3e3;
+    --err: #dc2626;
+    --err-dim: #fdeaea;
+
+    --radius: 10px;
+    --shadow: 0 1px 3px rgba(16, 24, 40, .06), 0 1px 2px rgba(16, 24, 40, .04);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --bg: #14181f;
+        --panel: #1c222b;
+        --panel-2: #232a34;
+        --border: #2f3844;
+        --text: #e5e9ef;
+        --text-dim: #9aa4b2;
+        --text-faint: #6b7684;
+
+        --brand: #5b95ff;
+        --brand-dim: #1e2c46;
+        --ok: #4ade80;
+        --ok-dim: #16301f;
+        --warn: #fbbf24;
+        --warn-dim: #362a12;
+        --err: #f87171;
+        --err-dim: #3a1c1c;
+
+        --shadow: 0 1px 3px rgba(0, 0, 0, .4);
+    }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI",
+          "PingFang SC", "Microsoft YaHei", "Helvetica Neue", sans-serif;
+    -webkit-text-size-adjust: 100%;
+}
+
+/* ==========================================================================
+   布局 —— 桌面三列：菜单 | 设置 | 日志
+   ==========================================================================
+ * ★ 为什么这么切（现场要求 2026-09-24）：
+ *   "修改为三列，日志固定不滚动，中间设置选项不变，右侧菜单宽度适当调整。"
+ *   （截图里红框标在设置区右侧，所以最终采用：菜单在左、设置在中、日志在右。）
+ *
+ *   .wrap    一行三块，高度锁死 100vh，**整页不再滚动**
+ *   .side    菜单（左）
+ *   .main    = .topbar（状态条）+ .body
+ *   .body    = .content（设置，自己滚）+ .logbox（日志，固定）
+ *
+ *   关键点：100vh 容器不滚，滚动收敛到 .content 这**一个**元素上 ——
+ *   这样翻设置时日志永远杵在原处，不会被滚出视野。
+ *   窄屏（<=1100px）退回"日志在底部"的老样子，见文件末尾的 @media。
+ * ========================================================================== */
+.wrap { display: flex; height: 100vh; overflow: hidden; }
+
+.side {
+    /* 208 → 190：三列之后横向空间更紧，菜单文字都不长，缩一点把宽度
+     * 让给设置区和日志区（现场说的"右侧菜单宽度适当调整"）。 */
+    width: 190px;
+    flex: 0 0 190px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 14px 10px;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+}
+
+.brand {
+    padding: 4px 8px 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 10px;
+}
+.brand b { display: block; font-size: 17px; letter-spacing: .3px; }
+.brand em {
+    display: block;
+    font-style: normal;
+    font-size: 12px;
+    color: var(--text-dim);
+    margin-top: 2px;
+}
+
+.menu { display: flex; flex-direction: column; gap: 2px; }
+.menu a {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 10px;
+    border-radius: 8px;
+    color: var(--text-dim);
+    text-decoration: none;
+    font-size: 14px;
+    cursor: pointer;
+}
+.menu a:hover { background: var(--panel-2); color: var(--text); }
+.menu a.on { background: var(--brand-dim); color: var(--brand); font-weight: 600; }
+.menu a .n {
+    margin-left: auto;
+    font-size: 11px;
+    color: var(--text-faint);
+}
+
+.main {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+}
+
+/* 设置区 + 日志区。min-height:0 是必须的 —— 否则 flex 子项按内容撑高，
+ * 里面的 overflow-y:auto 永远不生效（滚动条不出现，内容被裁掉）。 */
+.body { flex: 1 1 auto; display: flex; min-height: 0; }
+
+.topbar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    min-height: 50px;
+}
+.menu-btn {
+    display: none;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    border-radius: 8px;
+    width: 36px;
+    height: 34px;
+    font-size: 16px;
+    cursor: pointer;
+}
+.netitems { display: flex; gap: 14px; flex-wrap: wrap; }
+.netitem { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-dim); }
+.dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-faint);
+    flex: 0 0 8px;
+}
+.dot.on { background: var(--ok); box-shadow: 0 0 0 3px var(--ok-dim); }
+
+.alertbar { display: none; margin-left: auto; font-size: 13px; color: var(--warn); }
+.alertbar.show { display: inline; }
+
+/* ★ 唯一会滚的元素（桌面）。
+ *   padding 里留一点右边距，滚动条就不会贴着卡片。 */
+.content {
+    padding: 14px;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+}
+.page { display: none; }
+.page.on { display: block; }
+
+/* ==========================================================================
+   卡片与表单
+   ========================================================================== */
+.card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 14px;
+    margin-bottom: 14px;
+}
+.card > h2 {
+    margin: 0 0 10px;
+    font-size: 15px;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+.card > h2 .sub { font-size: 12px; font-weight: 400; color: var(--text-dim); }
+
+.kv {
+    display: flex;
+    gap: 10px;
+    padding: 6px 0;
+    border-bottom: 1px dashed var(--border);
+    font-size: 14px;
+}
+.kv:last-of-type { border-bottom: 0; }
+.kv > span { flex: 0 0 108px; color: var(--text-dim); }
+.kv > b { flex: 1 1 auto; font-weight: 600; word-break: break-word; min-width: 0; }
+
+.ok   { color: var(--ok); }
+.warn { color: var(--warn); }
+.err  { color: var(--err); }
+.dim  { color: var(--text-dim); }
+
+.row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.row > * { min-width: 0; }
+
+input, select {
+    flex: 1 1 150px;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+}
+input:focus, select:focus { outline: 2px solid var(--brand); outline-offset: -1px; }
+input::placeholder { color: var(--text-faint); }
+
+button {
+    padding: 9px 15px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text);
+    font-size: 14px;
+    font-family: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+}
+button:hover { border-color: var(--brand); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary {
+    background: var(--brand);
+    border-color: var(--brand);
+    color: #fff;
+    font-weight: 600;
+}
+button.primary:hover { filter: brightness(1.06); }
+button.danger {
+    background: var(--err);
+    border-color: var(--err);
+    color: #fff;
+    font-weight: 600;
+}
+
+.tip {
+    font-size: 12.5px;
+    color: var(--text-dim);
+    background: var(--panel-2);
+    border-left: 3px solid var(--border);
+    padding: 8px 10px;
+    border-radius: 0 6px 6px 0;
+    margin-top: 10px;
+}
+.tip.warn { border-left-color: var(--warn); background: var(--warn-dim); color: var(--text); }
+.tip.err  { border-left-color: var(--err);  background: var(--err-dim);  color: var(--text); }
+.tip.ok   { border-left-color: var(--ok);   background: var(--ok-dim);   color: var(--text); }
+
+/* ---- 说明块：可折叠，默认折叠 ----
+ * ★ 现场要求（2026-09-24）："将说明类的多行的增加可折叠选项，默认折叠，
+ *   需要查看时手动打开。" —— 三列之后设置区只有原来一半多宽，满屏的说明
+ *   文字会把真正的设置项挤到看不见的地方。
+ *
+ * 结构不是手写的，是 app.js 的 collapseTips() 在现场改写的：
+ *     <div class="tip">…</div>
+ *  →  <details class="tip"><summary>说明</summary><div class="tipin">…</div></details>
+ * 这样静态的 19 处和 JS 动态生成的那些都能覆盖，不用手改一大片 HTML，
+ * 以后新加的说明块也自动获得折叠能力。 */
+details.tip > summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: inherit;
+    user-select: none;
+}
+details.tip > summary::-webkit-details-marker { display: none; }
+details.tip > summary::before {
+    content: '▸';
+    color: var(--text-faint);
+    font-size: 11px;
+    line-height: 1;
+    transition: transform .15s;
+}
+details.tip[open] > summary::before { transform: rotate(90deg); }
+details.tip[open] > summary { margin-bottom: 7px; color: var(--text); }
+.tipin { color: var(--text-dim); }
+/* 接线表 / 业务配置是**多行等宽**文本（固件原样打出来的那份），
+ * 必须在深色主题下也能读、而且要能换行不撑破卡片。 */
+.tipin pre {
+    margin: 0;
+    padding: 9px 10px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-x: auto;
+}
+.tip.warn .tipin,
+.tip.err  .tipin,
+.tip.ok   .tipin { color: var(--text); }
+
+.hr { height: 1px; background: var(--border); margin: 12px 0; }
+
+/* ==========================================================================
+   标签 / 徽章
+   ========================================================================== */
+.badges { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.badge {
+    font-size: 12.5px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+}
+.badge.on { background: var(--ok-dim); border-color: var(--ok); color: var(--ok); font-weight: 600; }
+.badge.trig { background: var(--warn-dim); border-color: var(--warn); color: var(--warn); font-weight: 600; }
+.badge.off { opacity: .55; }
+
+/* ==========================================================================
+   WiFi 列表
+   ========================================================================== */
+.wifi-list {
+    max-height: 208px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-top: 8px;
+}
+.wifi-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 11px;
+    cursor: pointer;
+    font-size: 14px;
+    border-bottom: 1px solid var(--border);
+}
+.wifi-item:last-child { border-bottom: 0; }
+.wifi-item:hover { background: var(--panel-2); }
+.wifi-item.sel { background: var(--brand-dim); }
+.wifi-item .mark {
+    width: 12px; height: 12px;
+    border-radius: 50%;
+    border: 2px solid var(--text-faint);
+    flex: 0 0 12px;
+}
+.wifi-item.sel .mark { border-color: var(--brand); background: var(--brand); }
+.wifi-item .nm { flex: 1 1 auto; word-break: break-all; }
+.wifi-item .now { font-size: 11px; color: var(--ok); }
+.wifi-item .sig { font-size: 12px; color: var(--text-dim); }
+
+/* ==========================================================================
+   通道配置表
+   ========================================================================== */
+.acc-head, .acc-row {
+    display: grid;
+    grid-template-columns: 1fr 92px 44px;
+    gap: 8px;
+    align-items: center;
+}
+.acc-head {
+    font-size: 12px;
+    color: var(--text-dim);
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+}
+.acc-row { padding: 7px 0; border-bottom: 1px dashed var(--border); }
+.acc-row:last-child { border-bottom: 0; }
+.acc-row select { flex: none; width: 100%; }
+.swatch {
+    width: 34px; height: 30px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    padding: 0;
+    flex: 0 0 34px;
+}
+.acc-row .cur { font-size: 11px; color: var(--ok); }
+
+/* ==========================================================================
+   日志面板 —— 桌面下是**右侧固定一列**
+   ==========================================================================
+ * 它不是浮在内容上的层，而是 .body 里的第二个 flex 子项：
+ *   宽度  clamp(300px, 30vw, 460px)  —— 窄屏给下限、宽屏给上限，
+ *                                       中间随窗口伸缩（现场要的"调整宽度"）
+ *   高度  撑满 .body（= 撑满窗口减掉顶栏）
+ *   滚动  只在 .logpre 内部发生 → 这就是"固定不滚动"
+ * 折叠（.closed）是把**整列**收掉，顶栏会出现「显示日志」把它叫回来
+ * （见文件下方 .only-logoff）。
+ * ========================================================================== */
+.logbox {
+    flex: 0 0 clamp(300px, 30vw, 460px);
+    width: clamp(300px, 30vw, 460px);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    margin: 0;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow: hidden;
+}
+.logbox.closed { display: none; }
+.logbox .head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 11px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+}
+.logbox .head b { font-size: 13px; }
+.logbox .head .sp { margin-left: auto; }
+.logbox .head button { padding: 4px 10px; font-size: 12px; }
+
+/* 「显示日志」按钮：只在日志列被收起时出现，否则用户没有入口把它叫回来 */
+.only-logoff { display: none; }
+body.logoff .only-logoff { display: inline-block; }
+
+.logpre {
+    /* flex:1 + overflow-y:auto = 日志自己滚，列本身不动 */
+    flex: 1 1 auto;
+    min-height: 0;
+    margin: 0;
+    padding: 10px 11px;
+    overflow-y: auto;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: var(--text-dim);
+    background: var(--panel-2);
+}
+.logpre .e { color: var(--err); }
+
+/* ==========================================================================
+   Toast
+   ========================================================================== */
+.toast {
+    position: fixed;
+    left: 50%;
+    bottom: 22px;
+    transform: translate(-50%, 20px);
+    background: #1f2937;
+    color: #fff;
+    padding: 10px 16px;
+    border-radius: 999px;
+    font-size: 13.5px;
+    max-width: min(86vw, 460px);
+    text-align: center;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .18s, transform .18s;
+    z-index: 100;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .25);
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+.toast.ok  { background: #15803d; }
+.toast.bad { background: #b91c1c; }
+
+/* ==========================================================================
+   遮罩 / 加载
+   ========================================================================== */
+.overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 14, 20, .35);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 90;
+}
+.overlay.show { display: flex; }
+.loader {
+    width: 34px; height: 34px;
+    border: 3px solid rgba(255, 255, 255, .35);
+    border-top-color: #fff;
+    border-radius: 50%;
+    animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 进度条（OTA 上传用） */
+.progress {
+    height: 8px;
+    border-radius: 4px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    overflow: hidden;
+    margin-top: 10px;
+}
+.progress > i {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: var(--brand);
+    transition: width .12s linear;
+}
+
+/* ==========================================================================
+   中屏 / 窄屏：退回"设置在上、日志在下"的两段式
+   ==========================================================================
+ * 三列在 1100px 以下会把设置区挤成一条，还不如让日志回到页面底部 ——
+ * 这时用户多半是手机 / 小平板，一屏本来也装不下两块东西。
+ * ★ 必须把 .wrap / .main 的 100vh 锁死解开：外层 overflow:hidden 的话，
+ *   页面根本滚不到底部的日志，等于日志"消失"了。 */
+@media (max-width: 1100px) {
+    .wrap { display: block; height: auto; min-height: 100vh; overflow: visible; }
+    .main { height: auto; overflow: visible; }
+    .body { display: block; }
+    .content { overflow: visible; }
+    .logbox {
+        flex: none;
+        width: auto;
+        margin: 0 14px 14px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow);
+    }
+    .logpre { flex: none; max-height: 45vh; }
+}
+
+/* ==========================================================================
+   窄屏
+   ========================================================================== */
+@media (max-width: 760px) {
+    .side {
+        position: fixed;
+        left: 0;
+        top: 0;
+        z-index: 60;
+        transform: translateX(-100%);
+        transition: transform .18s;
+        box-shadow: 0 0 24px rgba(0, 0, 0, .18);
+    }
+    .side.open { transform: translateX(0); }
+    .menu-btn { display: block; }
+    .scrim {
+        position: fixed;
+        inset: 0;
+        background: rgba(10, 14, 20, .35);
+        z-index: 55;
+        display: none;
+    }
+    .scrim.show { display: block; }
+    .kv > span { flex-basis: 88px; font-size: 13px; }
+    .acc-head, .acc-row { grid-template-columns: 1fr 80px 40px; }
+    .logbox { margin: 0 10px 10px; }
+    .content { padding: 10px; }
+}

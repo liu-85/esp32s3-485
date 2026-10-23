@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2f6fed">
+<title>ESP-AMS 控制台</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div class="wrap">
+
+  <!-- ===================== 侧栏 ===================== -->
+  <aside class="side" id="side">
+    <div class="brand">
+      <b id="brand_name">ESP-AMS</b>
+      <em id="brand_net">连接中…</em>
+    </div>
+    <nav class="menu" id="menu"><!-- 由 app.js 生成 --></nav>
+  </aside>
+
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ===================== 主区 ===================== -->
+  <div class="main">
+
+    <div class="topbar">
+      <button class="menu-btn" id="menu_btn" aria-label="菜单">☰</button>
+      <div class="netitems">
+        <span class="netitem">
+          <span class="dot" id="dot_wifi"></span><span id="top_wifi">WiFi</span>
+        </span>
+        <span class="netitem">
+          <span class="dot" id="dot_mqtt"></span><span id="top_mqtt">MQTT</span>
+        </span>
+      </div>
+      <span class="alertbar" id="alertbar"></span>
+      <!-- 日志列收起后的入口（只在收起时出现，见 style.css 的 .only-logoff） -->
+      <button class="ghost only-logoff" id="btn_log_show" style="margin-left:auto">显示日志</button>
+    </div>
+
+    <!-- =====================================================================
+         body = 中间设置区 + 右侧日志区（桌面三列中的后两列）
+         日志列固定不滚动：滚动条只出现在 .content 里（见 style.css）
+         ===================================================================== -->
+    <div class="body">
+
+    <div class="content">
+
+      <!-- ============ 1. 运行状态 ============ -->
+      <section class="page" id="page_status">
+        <div class="card">
+          <h2>运行状态 <span class="sub" id="st_head"></span></h2>
+          <div class="kv"><span>IP 地址</span><b id="s_ip">-</b></div>
+          <div class="kv"><span>WiFi</span><b id="s_wifi">-</b></div>
+          <div class="kv"><span>信号强度</span><b id="s_rssi">-</b></div>
+          <div class="kv"><span>MAC 地址</span><b id="s_mac">-</b></div>
+          <div class="kv"><span>打印机 MQTT</span><b id="s_mqtt">-</b></div>
+          <div class="kv"><span>配置热点</span><b id="s_ap">-</b></div>
+          <div class="kv"><span>当前料盘</span><b id="s_cur">-</b></div>
+          <div class="kv"><span>固件版本</span><b id="s_ver">-</b></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_ap">打开配置热点</button>
+            <button class="ghost" id="btn_stop">紧急停止</button>
+          </div>
+          <div class="tip" id="status_tip"></div>
+        </div>
+
+        <div class="card">
+          <h2>换料动作 <span class="sub">AMS 状态机</span></h2>
+          <div class="kv"><span>当前状态</span><b id="a_state">-</b></div>
+          <div class="kv"><span>正在操作</span><b id="a_material">-</b></div>
+          <div class="kv"><span>换料统计</span><b id="a_exchange">-</b></div>
+          <div class="kv"><span>最近错误</span><b id="a_lasterr">-</b></div>
+          <div class="row">
+            <button class="ghost" id="btn_diag_reset" style="flex:1">重置统计</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>硬件状态 <span class="sub">共享电机 + 电磁离合</span></h2>
+          <div id="hardware_info"></div>
+        </div>
+      </section>
+
+      <!-- ============ 2. 上电诊断 ============ -->
+      <section class="page" id="page_diag">
+        <div class="card">
+          <h2>上电诊断 <span class="sub">「接上负载就一直重启」查这里</span></h2>
+          <div class="kv"><span>本次复位原因</span><b id="d_cause">-</b></div>
+          <div class="kv"><span>原因说明</span><b id="d_cause_desc">-</b></div>
+          <div class="kv"><span>启动次数</span><b id="d_boots">-</b></div>
+          <div class="kv"><span>本次已运行</span><b id="d_uptime">-</b></div>
+          <div class="kv"><span>空闲内存</span><b id="d_mem">-</b></div>
+          <div class="kv"><span>历史最低</span><b id="d_mem_min">-</b></div>
+          <div class="kv"><span>运行分区</span><b id="d_part">-</b></div>
+          <div class="kv"><span>编译时间</span><b id="d_build">-</b></div>
+          <div id="d_pins"></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_bootclear">重置启动计数</button>
+          </div>
+          <div class="tip">
+            ESP-IDF 版有独立看门狗任务，软件卡死会被及时发现并复位，
+            不会再出现「界面停住但板子还活着」的情况。
+            若反复欠压复位，先换 USB 口 / 短线 / 外接 5V —— 离合吸合瞬间电流很大。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 3. WiFi ============ -->
+      <section class="page" id="page_wifi">
+        <div class="card">
+          <h2>WiFi 配置 <span class="sub" id="wifi_head"></span></h2>
+          <div class="wifi-list" id="wifi_list">
+            <div class="wifi-item dim">点「重新扫描」搜索附近 WiFi</div>
+          </div>
+          <div class="row">
+            <input id="wifi_ssid_manual" placeholder="WiFi 名称（列表里没有就填这里）" autocomplete="off">
+          </div>
+          <div class="row">
+            <input type="password" id="wifi_pwd" placeholder="WiFi 密码" autocomplete="off">
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_wifi_conn">连接这个 WiFi</button>
+            <button id="btn_wifi_scan">重新扫描</button>
+          </div>
+          <div class="tip warn">
+            ★ <b>单射频限制</b>：ESP32 只有一个射频单元，配置热点开着的时候连不上路由器
+            （实测会一直报"找不到该 WiFi"）。所以点「连接这个 WiFi」之后，设备会<b>先关掉配置热点</b>
+            再去连路由器 —— 手机会短暂掉线，这是正常的，连上路由器后重新打开本页即可。
+            连不上的话热点会自动开回来，可以继续重试。
+          </div>
+          <div class="tip">
+            列表里是开机时扫到的网络。<b>热点上有手机连着时不再重新扫描</b> —— 官方配网文档明确写了
+            全信道扫描会让驱动来不及发信标、把已连上的手机踢下线。找不到目标网络就直接在上面填名称。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>配置热点</h2>
+          <div class="kv"><span>热点名称</span><b id="w_apssid">-</b></div>
+          <div class="kv"><span>热点地址</span><b id="w_apip">-</b></div>
+          <div class="kv"><span>已连设备</span><b id="w_apcli">-</b></div>
+          <div class="tip">
+            默认热点 <code>AMS_WIFI</code> / 密码 <code>A12345678</code>。
+            手机连上后浏览器打开 <code>http://192.168.4.1</code> 就能进这个页面。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 4. 打印机 MQTT ============ -->
+      <section class="page" id="page_mqtt">
+        <div class="card">
+          <h2>打印机 MQTT 配置 <span class="sub" id="mqtt_head"></span></h2>
+          <div class="kv"><span>配置是否已保存</span><b id="mqtt_saved">-</b></div>
+          <div id="mqtt_form"><div class="tip">加载中…</div></div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_mqtt_save">保存并连接</button>
+          </div>
+          <div class="tip">
+            访问码在打印机上找：<b>设置 → 网络 → 访问码</b>（8 位）。
+            出于安全考虑，设备<b>不会把已保存的访问码回传到网页</b> ——
+            输入框留空就表示不修改。
+            <div class="hr"></div>
+            连接用的是 TLS（端口 8883）。拓竹用的是自签证书，官方做法就是跳过校验；
+            跳过的只是"证明对端真的是拓竹打印机"，<b>传输过程一样是加密的</b>。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 5. 通道设置 ============ -->
+      <section class="page" id="page_access">
+        <div class="card">
+          <h2>打印机通道设置 <span class="sub">点色块改颜色</span></h2>
+          <div id="access_info"></div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:0 0 auto;font-size:13px" class="dim">当前通道</label>
+            <select id="cur_channel_sel" style="flex:1">
+              <option value="0">未知</option>
+              <option value="1">通道 1</option>
+              <option value="2">通道 2</option>
+              <option value="3">通道 3</option>
+              <option value="4">通道 4</option>
+              <option value="5">通道 5</option>
+              <option value="6">通道 6</option>
+              <option value="7">通道 7</option>
+              <option value="8">通道 8</option>
+            </select>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" style="flex:1" id="btn_access_save">保存通道与颜色</button>
+            <button class="ghost" style="flex:1" id="btn_cur_channel_save">保存当前通道</button>
+          </div>
+          <div class="tip">
+            「打印机通道」要和切片软件里的 AMS 槽位编号对上。
+            每个编号只能用一次 —— 两个料盘位指向同一个通道，换料时就不知道该动哪一路了。
+            <div class="hr"></div>
+            「当前通道」是打印机当前实际正在用的通道号。
+            切片文件开始打印时，AMS 会对比它和切片里第一个颜色需要的通道：
+            <b>一致 → 直接打印；不一致 → 自动执行换料任务</b>。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 6. 硬件调试 ============ -->
+      <section class="page" id="page_hardware">
+        <div class="card">
+          <h2>硬件调试 <span class="sub">共享电机 + 电磁离合</span></h2>
+          <div id="hardware_test"></div>
+          <div class="tip">
+            ★ 硬性约束：<b>任何时刻最多只有 1 路离合吸合</b>。
+            软件层有四重保障（吸合前强制全断开、吸合前回读复核、直接调用拦截、每周期体检），
+            所以「离合冲突次数」正常永远是 <b>0</b>。一旦不是 0，请断电检查驱动电路。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>手动点动 <span class="sub" id="jog_scope">所有通道统一</span></h2>
+          <div class="row">
+            <input type="number" id="jog_seconds" min="0.2" max="60" step="0.5" value="1">
+            <span style="align-self:center" class="dim">秒</span>
+            <button class="primary" style="flex:1" id="btn_jog_save">保存点动参数</button>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 auto;font-size:13px" class="dim">点动 PWM 占空比（5~100%）
+              <input type="number" id="jog_speed" min="5" max="100" step="5" style="width:90px">
+            </label>
+            <span id="jog_pwm_hint" class="dim" style="font-size:12px"></span>
+          </div>
+          <div class="tip">
+            <b>响应时间</b>：所有通道<b>统一</b>的「进退响应时间」，只作用于手动点动，
+            <b>不影响自动换料</b>。填超范围会被自动夹到 0.2 ~ 60 秒。
+            <div class="hr"></div>
+            <b>点动 PWM</b>（2026-09-23 新增）：<b>就是拿来目测"多少占空比能带动电机和电磁离合"的</b>。
+            默认 <b>100%</b>（duty 255）。<b>从 5% 一档一档往上加</b>，每加一档按一次上面的「进料」，
+            一边听电机声一边看日志：
+            <br>· 日志里出现 <code>点动回执…duty=128/255；硬件回读 IN1=128/255(引脚1)</code>
+            —— 信号确实写进硬件了，<b>此时电机不转就是占空比不够</b>，继续往上加；
+            <br>· 回读 <code>IN1=0/255</code> 而 duty 不是 0 —— 信号没写进硬件，是软件问题；
+            <br>· 找到"能可靠转起来"的最小值后<b>留一点余量</b>（机构有阻力、料路有弯），
+            再把带余量的值填到下面「辅助送料」的 PWM 速度里。
+            辅助送料默认 100%，宁可有力、不要没力。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>电机电流采样 <span class="sub">AT8236 ISEN · GPIO3 · 堵转保护</span></h2>
+          <div id="current_live" class="dim">读取中…</div>
+
+          <div class="row" style="margin-top:12px">
+            <label style="flex:1 1 120px;font-size:13px" class="dim">采样电阻（mΩ）
+              <input type="number" id="cur_r_mohm" min="10" max="2000" step="1" style="width:90px">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">堵转阈值（mA）
+              <input type="number" id="cur_stall_ma" min="0" max="20000" step="50" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <label style="flex:1 1 120px;font-size:13px" class="dim">持续多久算堵转（ms）
+              <input type="number" id="cur_stall_ms" min="20" max="5000" step="10" style="width:100px">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">起步屏蔽（ms）
+              <input type="number" id="cur_blank_ms" min="0" max="5000" step="50" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" style="flex:1" id="btn_cur_save">保存并生效</button>
+            <button style="flex:0 0 auto" id="btn_cur_clear">清除故障/峰值</button>
+            <button style="flex:0 0 auto" id="btn_cur_default">恢复默认</button>
+          </div>
+          <div class="tip">
+            <b>电流怎么来的</b>：AT8236 的 ISEN 脚输出电压 = 电机电流 × 采样电阻，
+            所以 <code>200mΩ</code> 就是 <code>200mV/A</code>。板上的 R11 就是 200mΩ，
+            换过电阻才需要改这个数。
+            <div class="hr"></div>
+            <b>堵转阈值要先测再用</b>：把阈值填 <code>0</code>（= 只显示、不保护），
+            然后<b>按「进料」让它正常送一段</b>，记下「均值」那一列；
+            再<b>故意卡住料路</b>让它堵转，记下堵转时的值。
+            <b>阈值取两者中间偏向正常值的那一侧</b>（比如正常 600mA、堵转 1800mA，
+            取 1200~1500mA）。
+            <div class="hr"></div>
+            <b>为什么会误跳</b>：直流电机<b>起动电流是稳态的 3~8 倍</b>，
+            所以有「起步屏蔽」这一项 —— 一开始转的那段时间<b>不判</b>。
+            起步容易误跳就把它调大（800~1200ms）。
+            <div class="hr"></div>
+            <b>芯片自己的硬限流约 2.5A</b>（VREF=5V ÷ (10 × 200mΩ)）。
+            固件阈值设在 2.5A 以上没有意义 —— 超过之后芯片先斩波，
+            电流读数会卡在一个平顶上，分不出真假堵转。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>辅助送料 <span class="sub">换色/流量校准时同步推料</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 auto;display:flex;align-items:center;gap:8px;font-size:14px">
+              <input type="checkbox" id="assist_enabled" style="width:20px;height:20px;accent-color:#2f6fed">
+              <span>辅助送料已启用</span>
+            </label>
+            <button class="ghost" id="btn_assist_toggle" style="flex:0 0 auto">切换开关</button>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">PWM 速度（%）
+              <input type="number" id="assist_speed" min="5" max="100" step="5" style="width:80px">
+            </label>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">每次时长（ms）
+              <input type="number" id="assist_ms" min="200" max="10000" step="100" style="width:90px">
+            </label>
+            <button class="primary" style="flex:1" id="btn_assist_save">保存</button>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 auto;display:flex;align-items:center;gap:8px;font-size:14px">
+              <input type="checkbox" id="assist_hold" style="width:20px;height:20px;accent-color:#2f6fed">
+              <span>阶段内保持离合吸合（只脉冲电机）</span>
+            </label>
+            <button class="ghost" id="btn_assist_hold" style="flex:0 0 auto">切换</button>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="ghost" style="flex:1" id="btn_assist_test">
+              ▶ 立即自检（按上面配置跑一次）
+            </button>
+          </div>
+          <div class="tip">
+            换色 / 校准挤出 / 流量校准 / 打印中，AMS 同步以该 PWM 推料，帮打印机齿轮咬住新料。
+            <div class="hr"></div>
+            <b>阶段内保持离合吸合</b>（2026-09-23 新增，默认<b>开</b>）：
+            在需要辅助送料的阶段里，电磁离合<b>全程吸着</b>，只有电机按周期脉冲（转 → 停 → 再转）；
+            离开这些阶段（或者打印机一来换料请求）<b>立刻断开</b>。
+            <br>为什么要这样：原来每送一次都是一整套"吸合 → 转 → 停 → 断开"，
+            而校准阶段只停 0.5 秒就再来一次 —— 实测那 <b>3 分 15 秒里离合咬合了 97 次</b>，
+            线圈和齿轮在反复咬合脱开。保持吸合之后，机械只咬一次。
+            <br>★ <b>硬件红线照旧守死：任何时刻最多 1 路吸合。</b>
+            吸合全部走 <code>clutch_engage()</code>（内部无条件先全断开、回读复核，再吸目标），
+            所以"保持"永远不会变成"又吸了一路"；主循环每周期还有一次体检兜底。
+            <b>「离合冲突次数」正常永远是 0。</b>
+            <br>⚠️ 若长时间保持后发现离合<b>发烫或有异响</b>，把这个开关关掉即可退回旧行为
+            （每次吸合-断开），不用换固件。
+            <div class="hr"></div>
+            <b>PWM 速度</b>：默认 <b>100%</b>，范围 5%~100%。
+            ⚠️ <b>低于 60% 会带不动本机构的电机</b> —— 现场表现为"电机没动作、听不到声"，
+            那是堵转不是没发指令。调的时候一边听电机声一边往上加，直到能听到明显转动。
+            <br>（2026-09-23 run7 实测：默认值原来是 60%，整轮打印的辅助送料回执全部正常
+            —— 离合吸合、duty=153 确实写出去了 —— <b>但料一动不动</b>；同一颗电机跑 100%
+            的退料/送料都正常。结论：60% 正好压在堵转线上，默认值已提到 100%。）
+            <div class="hr"></div>
+            <b>每次时长</b>：默认 1500ms，范围 200~10000ms。太短推不动料，太长会把料顶过头。
+            <div class="hr"></div>
+            <b>重复频率</b>（跟随上面的"每次时长"，没有单独参数）：
+            校准期间（校准挤出 / 流量校准）＝ 每次时长 + 停 0.5 秒；打印中 ＝ 每 5 秒一次。
+            校准阶段中途停一下是为了不把料一直顶死；<b>把"每次时长"往上调，校准时会更密</b>。
+            默认 1500ms 下，校准时大约每 2 秒送一次（≈ 转 1.5 秒 / 停 0.6 秒）。
+            <div class="hr"></div>
+            <b>怎么确认它真的动了</b>（这条最有用）：<b>先按上面的「立即自检」按钮</b>
+            —— 它会按你填的速度/时长立刻驱动一次当前通道，不用等下一轮打印。
+            每次辅助送料后面也会跟一条<b>执行回执</b>，形如
+            <code>辅助送料回执：离合已吸合 —— 通道2 PWM duty=153/255（60%），通电 1500ms；硬件回读 IN1=153/255(1) IN2=0/255(0)</code>。
+            <br>
+            <code>duty</code> 是<b>请求写下去</b>的数；<code>硬件回读</code>是
+            <b>从 LEDC 寄存器读回来</b>的数和引脚的<b>实际电平</b>。
+            两个一对照，四种情况立刻分清：
+            <br>· 只有「辅助送料…」却没有回执 → 电磁离合没吸合上，<b>根本没驱动电机</b>，
+            与占空比无关；
+            <br>· 回读 <code>IN1=0/255</code> 但 duty 非 0 → 信号<b>没写进硬件</b>，软件问题；
+            <br>· 回读 <code>IN1=153/255(1)</code>、通电 1500ms，电机还是不转 →
+            <b>占空比不够</b>，把 PWM 速度拉到 100% 再自检一次；
+            <br>· 100% 自检（<code>duty=255</code>）也不转 → 接线 / H 桥使能 / 离合打滑，
+            <b>不是参数问题</b>。此时用「手动点动」（默认也是全速 255，可在上面调）对照，
+            两者表现应当一致。
+            <br>网页「硬件状态 → 最近一次驱动 / LEDC 回读」里也有同样的数，不用抓串口。
+            <div class="hr"></div>
+            关闭总开关后换色/打印中都不再同步辅助送料。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>换色冲刷参数 <span class="sub">生成 change_filament_gcode 片段</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 120px;font-size:13px" class="dim">冲刷轮数
+              <input type="number" id="fl_rounds" min="1" max="4" step="1" value="2" style="width:70px">
+            </label>
+            <label style="flex:1 1 170px;font-size:13px" class="dim">每轮冲刷量 mm（逗号分隔）
+              <input type="text" id="fl_mms" value="30,15" style="width:120px">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">首次换料额外 mm
+              <input type="number" id="fl_first" min="0" max="200" step="5" value="50" style="width:70px">
+            </label>
+            <label style="flex:0 0 auto;display:flex;align-items:center;gap:6px;font-size:13px">
+              <input type="checkbox" id="fl_wipe" checked style="width:18px;height:18px;accent-color:#2f6fed">
+              <span>每轮后擦嘴</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" style="flex:1" id="btn_fl_gen">生成片段</button>
+            <button class="ghost" style="flex:0 0 auto" id="btn_fl_copy">复制</button>
+          </div>
+          <div class="kv" style="margin-top:8px"><span>合计冲刷量 / 预计耗时</span>
+            <b id="fl_est">—</b></div>
+          <textarea id="fl_out" readonly rows="9" style="width:100%;margin-top:8px;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.45"></textarea>
+          <div class="tip">
+            <b>这不是"打印机的固定流程"</b> —— 切刀、冲刷、擦嘴全部来自切片机器设置里的
+            <b>「换料 G-code」（change_filament_gcode）</b>，切片时就写死进 G-code 了，
+            板子改不了已经切好的文件。所以这里生成的是**给你粘回切片器**的片段。
+            <div class="hr"></div>
+            <b>怎么用</b>：在 Bambu Studio / Orca 里打开
+            「机器设置 → 换料 G-code」，把你现有宏里<b>「冲刷 1」那一行到「最终收尾」结束</b>
+            整段删掉，换成这里生成的内容，保存后重新切片。
+            切刀段、暂停段（<code>M73 P101</code> / <code>M400 U1</code>）、
+            末尾的 <code>M620/M621 / T{next_extruder}</code> 都不要动。
+            <div class="hr"></div>
+            <b>为什么要调</b>：默认的 4 轮（30/20/15/10 + 首次再加 50mm）是把旧颜色冲干净
+            的保守值。2026-09-23 run7 实测：一次换色里，从打印机暂停到它说"该你退料了"
+            （切刀 + 吐料）已经要 <b>18~24 秒</b>，resume 之后的 4 轮冲刷 + 擦嘴还要再占十几秒。
+            轮数减到 2、首次额外量减到 30，一般能省 <b>7~8 秒/次</b>（首次换色省得更多）；
+            代价是颜色交界处可能略微混色 —— 建议先只减轮数、别一次减太多。
+            <div class="hr"></div>
+            <b>预计耗时</b>是粗算（冲刷按 200/300 mm/min、每次擦嘴按 5 秒估的），
+            只用来比较不同参数的相对大小，不要当精确值。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>退料参数 <span class="sub">C3 降级模式：先连续拉，拉不出来再蠕动</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">连续退料（ms）
+              <input type="number" id="retract_cont_ms" min="1000" max="30000" step="500" style="width:100px">
+            </label>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">蠕动退料时长（ms）
+              <input type="number" id="retract_creep_ms" min="100" max="10000" step="100" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">蠕动间隔（ms）
+              <input type="number" id="retract_gap_ms" min="100" max="5000" step="100" style="width:100px">
+            </label>
+            <label style="flex:1 1 140px;font-size:13px" class="dim">蠕动轮数上限
+              <input type="number" id="retract_creep_max" min="0" max="20" step="1" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <label style="flex:1 1 140px;font-size:13px" class="dim">GPIO模式等信号（ms）
+              <input type="number" id="retract_wait_ms" min="1000" max="15000" step="500" style="width:100px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px;align-items:center">
+            <button class="primary" style="flex:1" id="btn_retract_save">保存退料参数</button>
+          </div>
+          <div class="tip">
+            <b>顺序是「先连续、后蠕动」</b>：打印机报 ams_status=260（切完刀、挤出机已跑回冲刷区、
+            该我们收线了）之后，<b>立刻全速连续拉料</b>，最长「连续退料」毫秒；期间每 250ms
+            查一次挤出机 MQTT 信号（hw_switch_state），一报"挤出机已空"就停，再多拉 0.5 秒收尾。
+            <div class="hr"></div>
+            拉满时间还没等到信号，才退回慢速蠕动：拱「蠕动轮数上限」轮，每轮「蠕动退料时长」，
+            轮间等「蠕动间隔」（同时查信号）。<b>轮数填 0 = 不做蠕动，只连续退料。</b>
+            <div class="hr"></div>
+            <b>GPIO模式等信号</b>：只有挤出机信号来源选了 GPIO 才会用到（C3 默认走 MQTT，用不到）。
+            <div class="hr"></div>
+            ⚠️ 蠕动速度在下面「蠕动参数」里调。实测 <b>45% 占空比完全带不动电机</b>
+            （24 秒蠕动一根料都没拉动），别把蠕动速度调低于 60%。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>换料温度 <span class="sub">退料 / 进料前先把热端升到这个温度</span></h2>
+          <div class="row" style="align-items:center">
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位1
+              <input type="number" id="temper_1" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位2
+              <input type="number" id="temper_2" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位3
+              <input type="number" id="temper_3" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位4
+              <input type="number" id="temper_4" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位5
+              <input type="number" id="temper_5" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位6
+              <input type="number" id="temper_6" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位7
+              <input type="number" id="temper_7" min="150" max="300" step="5" style="width:76px">
+            </label>
+            <label style="flex:1 1 80px;font-size:13px" class="dim">料盘位8
+              <input type="number" id="temper_8" min="150" max="300" step="5" style="width:76px">
+            </label>
+          </div>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" style="flex:1" id="btn_temper_save">保存换料温度</button>
+          </div>
+          <div class="tip">
+            换料时固件会先发 <b>M109 S&lt;温度&gt;</b> 把热端升到这个温度，再退料 / 进料。
+            <div class="hr"></div>
+            <b>太低</b>：热端里那段料是硬的，退不出来，远端电机硬拽会打滑、拉断、磨出屑。
+            <b>太高</b>：PLA 之类会烤糊、拉丝、堵头。
+            <div class="hr"></div>
+            参考值：<b>PLA 220</b> / <b>PETG 250</b> / <b>ABS 260</b> / <b>TPU 230</b>。
+            范围 150~300℃，未设置时默认 250。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 7. 微动开关 ============ -->
+      <section class="page" id="page_sensors">
+        <div class="card">
+          <h2>和打印机的通信方式 <span class="sub">四选一，改完重启生效</span></h2>
+          <div class="row">
+            <select id="comm_mode_sel" style="flex:1">
+              <option value="2">自动（先试 RS-485，不连就切 MQTT）—— 推荐</option>
+              <option value="3">RS-485 + WiFi 同时（调试：能实时看 485 报文）</option>
+              <option value="1">RS-485（BambuBus 直连，扮演真 AMS；保留 WiFi）</option>
+              <option value="0">MQTT（连打印机 Broker，解析 G-code 信号）</option>
+            </select>
+            <button id="btn_comm_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <label style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="wifi_on_chk" style="width:20px;height:20px">
+              <span>WiFi 上电就启动 <span class="sub">（关掉后微动 6/7/8 恢复可读，但网页打不开）</span></span>
+            </label>
+            <button id="btn_wifi_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="row" style="margin-top:8px">
+            <label style="flex:1;display:flex;align-items:center;gap:8px;cursor:pointer">
+              <input type="checkbox" id="act485_chk" style="width:20px;height:20px">
+              <span>485 运动执行 <span class="sub">（打开后，打印机点进料/退料会真的驱动本机电机；立即生效）</span></span>
+            </label>
+            <button id="btn_act485_save" style="flex:0 0 96px">保存</button>
+          </div>
+          <div class="kv"><span>当前生效</span><b id="comm_now">-</b></div>
+          <div class="kv"><span>WiFi 状态</span><b id="comm_wifi">-</b></div>
+          <div class="kv"><span>485 总线</span><b id="comm_bus">-</b></div>
+          <div class="tip">
+            <b>三条通路互斥，改完要重启才生效。</b>原因很简单：它们都能表达
+            「打印机要换料」，同时开着就是两份指令抢同一个状态机 —— 一条说送料、
+            另一条说退料，电机听谁的？所以切换只写配置，由重启决定这次起哪一条。
+            <div class="hr"></div>
+            <b>WiFi 上电就启动（默认开）</b>：开着 → 网页随时能看 485 报文，
+            但 WiFi 占用 ADC2，<b>微动 6/7/8（GPIO11/12/13）读不到</b>；
+            关掉 → 那三路立刻恢复正常，但<b>重启后网页打不开</b>
+            （要改回来只能重新烧录）。<b>所以顺序是：先开着调通 485，
+            最后再关。</b>
+            <div class="hr"></div>
+            <b>自动（推荐）</b>：开机先起 RS-485；<b>WiFi 上电开关开着时</b>
+            两者同时跑（不启 MQTT）；<b>关着时</b>才走原来的逻辑 ——
+            <b>2 分钟内</b>收到打印机任何一帧 → 保持 485 不开 WiFi；收不到 →
+            关掉 485、开 WiFi 走 MQTT。<b>只在开机判定一次</b>，运行期不来回切。
+            <div class="hr"></div>
+            <b>RS-485 + WiFi 同时（调试专用）</b>：WiFi 开机就起来，485 照常跑，
+            <b>不启 MQTT</b>。专门用来解决一个现场问题 —— <b>自动模式下开机
+            2 分钟没有 WiFi</b>，而打印机的总线枚举（广播 / 点名 / 握手）
+            <b>只在上电那一小会儿做</b>，等网页能连上时全过程早就结束了。
+            选这个模式重启，就能一边看网页一边看 485 的实时握手。
+            代价是微动 6/7/8（ADC2）读不到 —— <b>排查完请切回「自动」</b>。
+            <div class="hr"></div>
+            <b>原始报文在哪看</b>：下面「485 总线」那一行的
+            <b>「原始报文」</b>链接，或直接访问
+            <code>/bus485raw</code>。它吐的是<b>从上电第一帧开始</b>的双向记录
+            （毫秒时间戳 + RX/TX + 十六进制），所以<b>就算 WiFi 是两分钟后才
+            起来的，「自动」模式下那 2 分钟的握手也照样能回看</b>。
+            <div class="hr"></div>
+            <b>RS-485</b>：挂在打印机的 485 总线上，由打印机自己下发
+            「选中第几号槽 / 送料 / 退料」（不需要后处理脚本）。
+            <b>保留 WiFi</b>，网页随时能访问 —— 调试时选这个；代价是微动 6/7/8 降级。
+            <div class="hr"></div>
+            <b>MQTT</b>：我们主动连打印机的 MQTT Broker，靠解析 G-code 信令判断
+            要换哪一路（需要切片后处理脚本把颜色映射到槽号）。
+            <div class="hr"></div>
+            <b>485 本次的边界</b>：能应答注册 / 心跳 / 耗材信息（打印机界面里
+            能看到 <b>AMS-A + AMS-B 共 8 个槽</b>，颜色和温度都取自本页配置），
+            但收到运动指令只把原始帧写进日志、<b>不驱动电机</b> —— 字段含义要拿
+            真机抓帧确认后才放开，照别人的逆向结论硬套会把料退错方向。
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>微动开关 <span class="sub">每路 2 只：开始位 / 停止位（合占 1 个 ADC 口）</span></h2>
+          <div class="kv"><span>挤出机到位</span><b id="sg_extruder">-</b></div>
+          <div class="kv"><span>信号来源</span><b id="sg_src">-</b></div>
+          <div id="sensor_list"></div>
+          <div class="row">
+            <button class="ghost" style="flex:1" id="btn_src_toggle">切换到位信号来源</button>
+          </div>
+          <div class="tip">
+            <b>★ 本版接线（2026-10-22 起）：每路只用 1 个 ADC 口读两只微动</b><br>
+            开始位微动（常开）串 <b>4.7K</b>、停止位微动（常闭）串 <b>10K</b>，
+            两只并在同一个 GPIO 上，靠读电压分三档：
+            <b>≈220mV</b> = 开始位压下（缓冲器空，要补料）·
+            <b>≈600mV</b> = 中间（保持上一拍）·
+            <b>≈3300mV</b> = 停止位顶开（满了，停）。
+            <div class="hr"></div>
+            旧的「三只微动」接法（含第三只「自吸微动」）只剩 ESP32-C3 还在用；
+            <b>「自吸上料」功能已整套删除</b>，现在每路只有下面这两只。
+            <div class="hr"></div>
+            两只微动各自的作用：
+            <div class="hr"></div>
+            <b>停止送料</b>：触发 → 立刻停电机。料到位 / 料尽 / 机构顶到头都会触发它。<br>
+            <b>开始送料</b>：触发 → 按常规速度送料，直到停止送料微动触发或超时。
+            <div class="hr"></div>
+            <b>开关怎么对应：</b>「缓冲送料」这一个开关管<b>停止送料 + 开始送料</b>
+            这两只。
+            <div class="hr"></div>
+            <b>打印中 / 流量校准阶段（缓冲器闭环）：</b><br>
+            · 开了「缓冲送料」的通道 → 送与停<b>由缓冲器微动决定</b>
+              （开始送料微动触发就补料，停止送料微动触发就停），
+              <b>不再按时间间隔盲目送料</b>。<br>
+            · 微动连续 <b>15 秒</b>一点动作都没有 → 判定微动没反馈，
+              <b>自动退回</b>原来的「按时间间隔辅助送料」，先把这场打印跑完；
+              微动一恢复动作就自动回到缓冲闭环。
+              <div class="hr"></div>
+            <b>微动触发的两道门禁：</b><br>
+            · <b>没有打印任务时不动作</b>（空闲 / 打完 / 失败）——
+              开机震动、放料时手碰到微动，都不会让电机自己转起来。<br>
+            · <b>只有「当前通道」算数</b> —— 打印时打印机只用一路，
+              其他路的微动触发了也不动作。<br>
+            上面「门禁」那一行会实时显示这两道门的状态。
+            <div class="hr"></div>
+            <b>换料时不看微动：</b><br>
+            换料的送料<b>只认打印机的「耗材已到挤出机」信号</b>，
+            途中<b>不执行</b>「停止送料微动触发就停」。原因是缓冲器阻力比挤出机小，
+            料会先在缓冲器里堆住把微动顶住 —— 按它停料就到不了挤出机，
+            打印机随后就报故障。手动「送料」按钮仍然按微动停（那是给你调试
+            缓冲区用的动作）。
+            <div class="hr"></div>
+            <span class="dim">
+              · 开关关掉 → 这一路退回<b>降级模式</b>（按时间 / 闭环推进送料，
+                时长由固件里的 AMS_NO_LIMIT_LOAD_MS / RETRACT_MS 决定）。
+            </span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>蠕动送料参数 <span class="sub">换料收尾用</span></h2>
+          <div class="row">
+            <label style="flex:1 1 120px;font-size:13px" class="dim">次数
+              <input type="number" id="creep_times" min="1" max="10" step="1">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">单次时长(ms)
+              <input type="number" id="creep_pulse" min="100" max="3000" step="50">
+            </label>
+            <label style="flex:1 1 120px;font-size:13px" class="dim">速度(%)
+              <input type="number" id="creep_speed" min="5" max="100" step="5">
+            </label>
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_creep_save">保存蠕动参数</button>
+          </div>
+          <div class="tip">
+            速度越低、脉冲越短 → 越"温柔"，但也越可能没把料咬住；
+            次数越多 → 越可靠，但每多一次就多一次机械磨损。
+            默认 <b>3 次 × 400ms @ 70%</b>。
+            <div class="hr"></div>
+            ⚠️ <b>「速度」低于 60% 会带不动本机构的电机</b>：现象是"电机不转、也听不到声"，
+            那是占空比太低在堵转，不是指令没发出去。实测 45% 时蠕动退料跑满 24 秒
+            一根料都没拉动。要调慢就加长「单次时长」，别把速度往下压。
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 8. 系统升级 ============ -->
+      <section class="page" id="page_ota">
+        <div class="card">
+          <h2>系统升级 <span class="sub">网页上传整机固件，不用插 USB</span></h2>
+          <div class="kv"><span>当前运行分区</span><b id="o_part">-</b></div>
+          <div class="kv"><span>当前版本</span><b id="o_ver">-</b></div>
+          <div class="tip ok">
+            ★ 这版是<b>真正的双分区 OTA</b>：新固件写进备用分区，校验通过才切换，
+            写一半断电也不影响启动；新固件第一次启动如果崩溃，引导程序会<b>自动回滚</b>。
+            MicroPython 那版因为只有一个应用分区，只能升级「应用与界面」，
+            整机固件必须插 USB。
+          </div>
+          <div class="row">
+            <input type="file" id="ota_file" accept=".bin">
+          </div>
+          <div class="row">
+            <button class="primary" style="flex:1" id="btn_ota_upload">上传并升级</button>
+          </div>
+          <div class="progress" id="ota_prog" style="display:none"><i></i></div>
+          <div id="ota_box"></div>
+          <div class="tip warn" id="ota_tip">
+            要传的是 <code>idf.py build</code> 出来的 <code>esp-ams-s3.bin</code>
+            （或 <code>build/esp-ams-s3.bin</code>）。
+            传错文件不会造成损坏 —— 设备会检查首字节是不是 <code>0xE9</code>，
+            不是就直接中止，分区一个字节都不动。
+          </div>
+        </div>
+      </section>
+
+    </div><!-- /content -->
+
+      <!-- ===================== 日志（右列，固定不滚动） ===================== -->
+      <div class="logbox" id="logbox">
+        <div class="head">
+          <b>设备日志</b>
+          <span class="sp"></span>
+          <span class="dim" id="log_mem"></span>
+          <button id="btn_log_clear">清屏</button>
+          <button id="btn_log_toggle">收起</button>
+        </div>
+        <pre class="logpre" id="log_lines">等待日志…</pre>
+      </div>
+
+    </div><!-- /body -->
+
+  </div><!-- /main -->
+</div><!-- /wrap -->
+
+<div class="toast" id="toast"></div>
+<div class="overlay" id="overlay"><div class="loader"></div></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

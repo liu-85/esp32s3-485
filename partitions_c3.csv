@@ -1,0 +1,26 @@
+# ===========================================================================
+# 分区表 —— ESP32-C3 / 4MB Flash（WROOM/WROVER 模组）
+# ===========================================================================
+# 与 S3 版（partitions.csv）的区别：
+#   · C3 常见模组 Flash 只有 4MB，没有 16MB 那么大
+#   · 砍掉 storage（1MB）和 coredump（64KB），把 app 分区缩到 1.5MB
+#   · ota_0 + ota_1 各 1.5MB，能装下本工程（应用 + 嵌入式 web ≈ 1.2MB）
+#
+# 尺寸账（0x000000 ~ 0x400000，正好 4.0MB）：
+#   0x9000     24KB   nvs
+#   0xF000     8KB    otadata
+#   0x11000    4KB    phy_init
+#   0x13000    1KB    efuse 校准
+#   0x20000    1.5MB  ota_0   （0x20000  ~ 0x16FFFF）
+#   0x170000   1.5MB  ota_1   （0x170000 ~ 0x2BFFFF）  ← 紧接 ota_0
+#   0x2C0000   剩余   留空（约 1.125MB 余量给日志 / SPIFFS 未来扩展）
+#
+# ⚠️ 本文件**绝对不能带 UTF-8 BOM**（原因见 partitions.csv 顶部说明）。
+# ---------------------------------------------------------------------------
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xF000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+efuses,     data, efuse,    0x13000,  0x400,
+ota_0,      app,  ota_0,    0x20000,  0x150000,
+ota_1,      app,  ota_1,    0x170000, 0x150000,

@@ -1,0 +1,42 @@
+# ===========================================================================
+# sdkconfig.defaults.esp32c3 —— ESP32-C3 目标专属配置
+# ===========================================================================
+# idf.py set-target esp32c3 后，构建系统会同时读：
+#   sdkconfig.defaults          （通用配置）
+#   sdkconfig.defaults.esp32c3  （本文件，C3 专属覆盖）
+# 后者优先级更高，所以这里只写"和 S3 版不一样"的项。
+#
+# C3 与 S3 关键差异：
+#   · C3 单核 RISC-V，主频 160MHz
+#   · 通用 IO 只有 GPIO0~9，无 PSRAM
+#   · Flash 通常 4MB（本工程用 WROOM 模组）
+#   · 内置 USB / SPI 占用 GPIO19~21
+# ---------------------------------------------------------------------------
+
+# 目标芯片
+CONFIG_IDF_TARGET="esp32c3"
+
+# 4MB Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# 自定义分区表（C3 专属，见 partitions_c3.csv）
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c3.csv"
+
+# 单核 + 160MHz
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_160=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=160
+
+# FreeRTOS 栈收紧（C3 只有 320KB SRAM，比 S3 紧张很多）
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=4096
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=2560
+CONFIG_MQTT_TASK_STACK_SIZE=4096
+
+# C3 没有 PSRAM，显式关掉（防止默认值意外打开）
+CONFIG_SPIRAM=n
+
+# C3 的 efuse 分区已写入 partitions_c3.csv
+CONFIG_ESP_EFUSE_ENABLED=y
+
+# OTA 允许回滚（与 S3 一致）
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

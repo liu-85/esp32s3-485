@@ -1,0 +1,290 @@
+# ===========================================================================
+# GitHub Actions —— ESP-AMS-S3 自动编译 + 发布（双目标 matrix）
+# ===========================================================================
+# 推送到 main / 打 tag 时自动编译两个目标：
+#   · esp32s3 —— 4 通道完整方案（默认）
+#   · esp32c3 —— 2 通道降级方案
+# 打 tag 时把两个目标的固件都发到 GitHub Releases。
+
+name: Build & Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ esp32s3, esp32c3 ]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ESP-IDF and build firmware
+        run: |
+          set -e
+          TARGET="${{ matrix.target }}"
+          # ---- 安装 ESP-IDF v5.3.2 ----
+          cd $HOME
+          if [ ! -d esp-idf ]; then
+            git clone --depth 1 -b v5.3.2 https://github.com/espressif/esp-idf.git esp-idf
+            cd esp-idf
+            ./install.sh "$TARGET" > /tmp/idf-install.log 2>&1 || {
+              echo "--- install log ---"
+              tail -50 /tmp/idf-install.log
+              exit 1
+            }
+            cd $HOME
+          fi
+
+          # ---- 激活环境（source 必须在同一 shell 里）----
+          source $HOME/esp-idf/export.sh
+
+          # ---- 编译 ----
+          cd $GITHUB_WORKSPACE
+
+          # mdns 在 ESP-IDF v5.x 已从内置移到组件注册表，直接 clone 到 components/ 下
+          if [ ! -d components/mdns ]; then
+            echo "Fetching mdns component from esp-protocols..."
+            mkdir -p components
+            git clone --depth 1 -b master --filter=blob:none \
+              https://github.com/espressif/esp-protocols.git /tmp/esp-protocols
+            cp -r /tmp/esp-protocols/components/mdns components/mdns
+            rm -rf /tmp/esp-protocols
+          fi
+
+          # ---- 目标专属 sdkconfig（C3 走 sdkconfig.defaults.esp32c3）----
+          idf.py set-target ${TARGET}
+
+          # ---- 编译 ----
+          # ★ 输出同时落一份到 /tmp/build.log：编译失败时，下一个 step 会从里面
+          #   提取错误行、以 ::error:: 注解的形式发出来。
+          #   为什么要这么绕：GitHub 的"下载 job 日志"接口需要仓库管理员权限，
+          #   而本机（开发用的那台 Windows）**没有 gcc / ESP-IDF**，本地根本
+          #   编不出来，只能靠 CI 给答案。没有日志就等于纯盲猜 ——
+          #   2026-09-23 那次就是这样，注释里只看到 "exit code 2"，白耗了一轮。
+          #   注解走的是 check-runs API，匿名就能读，所以把错误做成注解最省事。
+          #   pipefail：让管道里 idf.py 的失败码能传出来（否则 tee 的 0 会盖掉它）。
+          set -o pipefail
+          idf.py build 2>&1 | tee /tmp/build.log
+
+          # ---- 合并为单文件刷写 ----
+          idf.py merge-bin
+
+          # ---- 收集产物：firmware + bootloader + partition + merged ----
+          mkdir -p dist
+          cp -v build/${TARGET}-ams.bin dist/firmware_${TARGET}.bin 2>/dev/null || \
+            cp -v build/esp-ams-s3.bin dist/firmware_${TARGET}.bin
+          cp -v build/bootloader/bootloader.bin dist/bootloader_${TARGET}.bin 2>/dev/null || \
+            echo "WARN: bootloader.bin not found"
+          # C3 用 partitions_c3.csv，S3 用 partitions.csv
+          if [ "${TARGET}" = "esp32c3" ]; then
+            cp -v build/partition_table/partition-table.bin dist/partition_table_${TARGET}.bin 2>/dev/null || \
+              echo "WARN: C3 partition-table.bin not found"
+          else
+            cp -v build/partition_table/partition-table.bin dist/partition_table_${TARGET}.bin 2>/dev/null || \
+              echo "WARN: partition-table.bin not found"
+          fi
+          # merge-bin 输出文件（可能叫 *-merged.bin 或 *-full.bin）
+          for f in build/*-${TARGET}-merged.bin build/*-merged.bin build/*-full.bin; do
+            if [ -f "$f" ]; then
+              cp -v "$f" dist/${TARGET}_merged.bin
+              echo "Found merged binary for ${TARGET}: $f"
+            fi
+          done
+          ls -lh build/*.bin 2>/dev/null
+          {
+            echo "commit: $(git rev-parse --short HEAD)"
+            echo "branch: $(git rev-parse --abbrev-ref HEAD)"
+            echo "date:   $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo "idf:    v5.3.2"
+            echo "target: ${TARGET}"
+          } > dist/version_${TARGET}.txt
+          echo "--- artifacts for ${TARGET} ---" && ls -lh dist/
+
+      # =====================================================================
+      # 编译失败时，把错误行做成 GitHub 注解
+      # =====================================================================
+      # 目的：让"没有仓库权限、看不到 job 日志"的环境也能读到编译错误。
+      # 注解可以匿名通过 check-runs API 取到：
+      #   GET /repos/{owner}/{repo}/check-runs/{id}/annotations
+      # 而 job 日志接口（/actions/jobs/{id}/logs）要求管理员权限，匿名是 403。
+      # 本机没有 gcc / ESP-IDF，编译验证只能靠 CI —— 这条通道就是那双眼。
+      - name: Report compile errors as annotations
+        if: failure()
+        run: |
+          LOG=/tmp/build.log
+          if [ ! -f "$LOG" ]; then
+            echo "::error title=CI::没拿到编译日志 —— 失败发生在 idf.py build 之前（多半卡在 ESP-IDF 克隆/安装，或 mdns 组件拉取）"
+            exit 0
+          fi
+          echo "--- 提取编译错误（最多 10 条，转成注解）---"
+          grep -nE "error:|undefined reference|implicit declaration|ninja: build stopped|FAILED: " "$LOG" \
+            | head -10 \
+            | while IFS= read -r l; do
+                # 注解的正文不能有换行；% 要转义成 %25（GitHub 自己的转义规则）
+                msg=$(printf '%s' "$l" | tr -d '\r' | sed -e 's/%/%25/g' -e 's/\t/    /g' | cut -c1-900)
+                echo "::error title=编译错误::$msg"
+              done || true
+          echo "--- 日志尾部 40 行 ---"
+          tail -40 "$LOG" || true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-ams-${{ matrix.target }}-build
+          path: dist/
+          retention-days: 30
+
+  # =========================================================================
+  # Windows EXE 工具编译（PyInstaller 打包 esp_ams_postprocess.py）
+  # =========================================================================
+  build-exe:
+    runs-on: windows-latest
+    if: github.event_name == 'push' || startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Build EXE
+        run: |
+          cd tools
+          python build_exe.py
+
+      - name: Package EXE as zip
+        run: |
+          Compress-Archive -Path "tools/dist/esp_ams_tool" -DestinationPath "esp_ams_tool_win64.zip"
+          Write-Host "Created esp_ams_tool_win64.zip"
+          Get-ChildItem -Recurse "tools/dist/esp_ams_tool" | Select-Object Name, Length
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-ams-tool-exe
+          path: esp_ams_tool_win64.zip
+          retention-days: 30
+
+      - name: Attach EXE to release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" esp_ams_tool_win64.zip --clobber
+          echo "EXE uploaded to release"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download S3 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp-ams-esp32s3-build
+          path: dist_s3/
+
+      - name: Download C3 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: esp-ams-esp32c3-build
+          path: dist_c3/
+
+      - name: Create GitHub Release
+        # 原为 softaction/touch-release@v1 —— 该 action 在 GitHub 上不存在（API 返回 404），
+        # 一打 tag 这一步就必然失败。换成社区标准实现 softprops/action-gh-release。
+        # 注意它的标题参数叫 name（不是 release_name），顺手改了，否则标题会退化成 tag 名。
+        uses: softprops/action-gh-release@v2
+        id: rel
+        with:
+          name: "esp-ams ${{ github.ref_name }}"
+          draft: false
+          body: |
+            自动编译发布（双目标：ESP32-S3 + ESP32-C3）。
+
+            ---
+
+            ## ESP32-S3（4 通道完整方案）
+
+            **固件文件**
+            - `s3_merged.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
+            - `firmware_esp32s3.bin` — 仅应用（OTA 升级用）
+            - `version_esp32s3.txt` — 编译元信息
+
+            **首次烧录（USB 口）**
+            ```bash
+            esptool --chip esp32s3 --port COM3 --baud 921600 write_flash 0x0 s3_merged.bin
+            ```
+            或（Windows）：
+            ```bat
+            esptool.exe --chip esp32s3 --port COM3 --baud 921600 write_flash 0x0 s3_merged.bin
+            ```
+
+            **OTA 升级**：设备 Web 端直接上传 `firmware_esp32s3.bin`。
+
+            ---
+
+            ## ESP32-C3（2 通道降级方案）
+
+            > ⚠️ C3 版没有微动开关引脚，完全依赖 MQTT 事件 + 超时模式驱动。
+            > 挤出机到位信号也只走 MQTT（hw_switch_state）。
+
+            **固件文件**
+            - `c3_merged.bin` — 合并固件（bootloader + 分区表 + 应用）
+            - `firmware_esp32c3.bin` — 仅应用（OTA 升级用）
+            - `version_esp32c3.txt` — 编译元信息
+
+            **首次烧录（USB 口 / UART0）**
+            ```bash
+            esptool --chip esp32c3 --port COM5 --baud 460800 write_flash 0x0 c3_merged.bin
+            ```
+            > C3 模组通常通过 USB（CP2102 / CH340） 转 UART 烧录，波特率 460800 比较稳。
+
+            **OTA 升级**：设备 Web 端直接上传 `firmware_esp32c3.bin`。
+
+            ---
+
+            ## 通用烧录说明
+
+            1. **下载 esptool**（如果还没有）：`pip install esptool`
+            2. **进下载模式**：按住 BOOT 按钮，按一下 RST，松开 BOOT
+            3. **找 COM 口**：设备管理器（Win）/ `ls /dev/ttyUSB*`（Linux）
+            4. **烧录**：把 merged.bin 刷到 `0x0` 地址（里面已包含 bootloader + 分区表）
+            5. **重启**：按一下 RST 即可
+
+      - name: Attach binaries to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p upload
+          # 重命名成对目标友好的文件名
+          cp dist_s3/*_merged.bin upload/s3_merged.bin
+          cp dist_s3/firmware_esp32s3.bin upload/
+          cp dist_s3/version_esp32s3.txt upload/
+          cp dist_c3/*_merged.bin upload/c3_merged.bin
+          cp dist_c3/firmware_esp32c3.bin upload/
+          cp dist_c3/version_esp32c3.txt upload/
+          ls -lh upload/
+          gh release upload "${{ github.ref_name }}" \
+            upload/s3_merged.bin \
+            upload/firmware_esp32s3.bin \
+            upload/version_esp32s3.txt \
+            upload/c3_merged.bin \
+            upload/firmware_esp32c3.bin \
+            upload/version_esp32c3.txt \
+            --clobber

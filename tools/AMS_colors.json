@@ -1,0 +1,23 @@
+{
+  "selected_channel": 1,
+  "AMS": [
+    {"channel": "1", "color": [255, 255, 255]},
+    {"channel": "2", "color": [128, 128, 0]},
+    {"channel": "3", "color": [0, 0, 0]},
+    {"channel": "4", "color": [0, 0, 255]},
+    {"channel": "5", "color": [0, 0, 0]},
+    {"channel": "6", "color": [128, 128, 128]},
+    {"channel": "7", "color": [255, 255, 0]},
+    {"channel": "8", "color": [0, 0, 255]}
+  ],
+  "channel_states": {
+    "1": 0,
+    "2": 2,
+    "3": 0,
+    "4": 0,
+    "5": 3,
+    "6": 3,
+    "7": 3,
+    "8": 3
+  }
+}

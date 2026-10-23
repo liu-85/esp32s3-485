@@ -1,0 +1,58 @@
+# ===========================================================================
+# 分区表 —— ESP32-S3 / 8MB Flash（N8R8 / N16R8 类模组）
+# ===========================================================================
+#
+# ⚠️ 本文件**绝对不能带 UTF-8 BOM**（开头那个看不见的 EF BB BF）。
+#    原因：ESP-IDF 生成分区表用的是 components/partition_table/gen_esp32part.py，
+#    它以二进制读入后 data.decode()（默认 utf-8，**不是** utf-8-sig），再用
+#       line.strip().startswith('#')
+#    跳过注释行。带 BOM 时首字符是 U+FEFF 而不是 '#'，跳过逻辑失效 ——
+#    这行注释会被当成一条分区定义去解析，然后报
+#       Field 'type' can't be left empty.
+#    构建直接失败，而且报错信息完全指不到"BOM"上，很难查。
+#    tools/lint_c.py 里有专门的 BOM 检查，别把它关了。
+#
+# 和 MicroPython 那版最大的不同：**这里是真的双分区 OTA**
+#
+#   MicroPython 版的 OTA 只能更新「应用与界面」（.ams 包），更新不了整机固件
+#   —— 因为它的分区表里只有一个 factory 应用分区，没有备用分区可以切换，
+#   没法安全地重写"正在运行的自己"。
+#
+#   ESP-IDF 这版留了 ota_0 / ota_1 两块应用分区 + 一块 otadata 记录"下次从哪
+#   块启动"。升级时往**另一块**写，写完改 otadata 再重启 —— 所以网页上可以
+#   直接升级**整机固件**，刷坏了还能自动回滚到上一版。这正是当初加 OTA 想做
+#   而做不到的事。
+#
+# 各分区说明：
+#   nvs        保存 WiFi / 打印机参数 / 通道映射 / 当前料盘（对应 config.json）
+#   otadata    两字节的"下次从哪块 app 启动"，由 esp_ota 自动维护
+#   phy_init   射频校准数据，ESP-IDF 要求保留
+#   ota_0/ota_1 两块等大的应用分区，轮流做"当前版本 / 备用版本"
+#   storage    预留的 SPIFFS 分区，放可热更新的资源 / 导出日志
+#              （网页资源默认编译进固件，见 main/CMakeLists.txt 的 EMBED_FILES）
+#   coredump   崩溃现场转储。★ 这个分区是必须手动加的：
+#              sdkconfig.defaults 里开了 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH，
+#              而 IDF 自己的 Kconfig 帮助文本就写了"使用自定义分区表时必须加
+#              对应条目"。少了它不会编译失败，只是崩溃时**静默地什么都存不下**
+#              —— 而本项目恰好有过"接上负载就重启"的历史问题，真要定位就靠它。
+#
+# 尺寸账（0x000000 ~ 0x810000，共 8.06MB，16MB Flash 还有约 8MB 余量）：
+#   0x9000   24KB   nvs
+#   0xF000   8KB    otadata
+#   0x11000  4KB    phy_init
+#   0x20000  3MB    ota_0
+#   0x300000 3MB    ota_1
+#   0x600000 1MB    storage
+#   0x700000 64KB   coredump
+#
+# ⚠️ 4MB Flash 的 S3 模组装不下这个表，需要把 storage 和 coredump 去掉、
+#    并把两块 app 缩到 1.5MB（见 README「4MB 模组怎么办」）。
+# ---------------------------------------------------------------------------
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xF000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+ota_0,      app,  ota_0,    0x20000,  0x2E0000,
+ota_1,      app,  ota_1,    0x300000, 0x2E0000,
+storage,    data, spiffs,   0x600000, 0x100000,
+coredump,   data, coredump, 0x700000, 0x10000,

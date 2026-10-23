@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  ESP-AMS 配置工具的应用程序清单（PyInstaller 的 manifest 选项用）。
+  注意：XML 注释里不能出现连续两个短横线，所以本文不写命令行参数原文。
+
+  为什么必须有这个文件：
+    PyInstaller 打出来的 exe 默认不带 dpiAware，进程是 DPI-unaware 的。
+    在 125% / 150% 缩放的屏幕上，Windows 会把整个窗口当位图拉伸，
+    界面必然发虚，而且 GetDpiForWindow 只会回 96（等于自欺欺人）。
+    声明成 PerMonitorV2 之后，Tk 才知道真实 DPI，字体按真实 DPI 渲染，
+    代码里的 ui_px() 缩放也才能对上。
+
+  longPathAware：顺手打开，配置路径深一点也不会撞 260 字符上限。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="ESP-AMS.ConfigTool"
+                    version="1.0.0.0" processorArchitecture="*"/>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">permonitorv2,permonitor</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+    </application>
+  </compatibility>
+</assembly>

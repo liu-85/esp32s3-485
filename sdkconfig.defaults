@@ -1,0 +1,131 @@
+# ===========================================================================
+# sdkconfig.defaults —— 本工程的默认配置
+# ===========================================================================
+#
+# idf.py 第一次 build 时会用这里的值生成 sdkconfig。
+# 想在菜单里改可以用 `idf.py menuconfig`，但**改完记得把有意义的项同步回本
+# 文件**，否则下次清空构建（rm -rf build）又会退回默认值。
+#
+# 每一项后面都写了"为什么"，改之前先读一遍。
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 目标芯片与 Flash
+# ---------------------------------------------------------------------------# 目标芯片与 Flash
+# 默认目标：esp32s3（4 通道完整方案）
+# C3 目标走 sdkconfig.defaults.esp32c3（4MB Flash / 单核 / 栈收紧）
+CONFIG_IDF_TARGET="esp32s3"
+
+# 16MB Flash —— N16R8 42 针模组（16MB Flash + 8MB PSRAM）。
+# 若你的模组是 8MB，改成 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y 并同步缩 partitions.csv。
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# 自定义分区表（见 partitions.csv）
+# C3 目标走 sdkconfig.defaults.esp32c3 覆盖成分区表 partitions_c3.csv
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------------------------------------------------------------------------
+# PSRAM
+# ---------------------------------------------------------------------------
+# 本工程**不依赖** PSRAM。先关掉 PSRAM 确保能正常启动，
+# 待确认稳定后再按需打开。打开后 GPIO33~37 会被 PSRAM 占用。
+# 要重新启用 PSRAM，把下面改为：
+#   CONFIG_SPIRAM=y
+#   CONFIG_SPIRAM_MODE_OCT=y
+#   CONFIG_SPIRAM_USE_MALLOC=y
+#   CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384
+#   CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+CONFIG_SPIRAM=n
+
+# ---------------------------------------------------------------------------
+# WiFi / lwIP
+# ---------------------------------------------------------------------------
+# 关掉 WiFi 省电（modem sleep）。★这一条是本工程最关键的配置之一★
+#
+#   在 MicroPython 那版上踩了很久：ESP32 默认 pm=1 会让射频在空闲时打盹，
+#   持续传大文件时会中途掉关联，表现是"网页永远打不开"。
+#
+#   ⚠️ 这里**故意不写 Kconfig 项**：Wi-Fi 省电模式在 ESP-IDF 里是**运行时**
+#      设置，没有对应的 sdkconfig 开关（早先误写过 CONFIG_ESP_WIFI_POWER_SAVE_NONE，
+#      那个符号根本不存在，只会换来一条 "unknown config item" 警告并让人误以为
+#      已经关掉了）。真正的关闭动作在 wifi_manager.c 的 wifi_mgr_init() 里：
+#
+#          esp_wifi_set_ps(WIFI_PS_NONE);
+#
+#      这是唯一正确的位置，改代码时别把它删掉。
+
+# 收发缓冲：默认值对 8MB/PSRAM 模组偏小，这里给足，避免TCP 大量重传
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=32
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+
+# 同时开着 AP+STA（配网时两个口并存），所以模式是 NULL/APSTA 都要支持
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+
+# lwIP：Web 是多连接并发的，socket 数别抠
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_SO_REUSE=y
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=11680
+CONFIG_LWIP_TCP_WND_DEFAULT=11680
+
+# ---------------------------------------------------------------------------
+# HTTP 服务器
+# ---------------------------------------------------------------------------
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+CONFIG_HTTPD_WS_SUPPORT=n
+
+# ---------------------------------------------------------------------------
+# MQTT over TLS
+# ---------------------------------------------------------------------------
+# 拓竹打印机用的是自签证书，校验不可能通过 —— 这是官方文档也认可的用法。
+# 关掉证书校验只影响"证明对端是拓竹打印机"，不影响链路加密。
+CONFIG_MQTT_PROTOCOL_311=y
+CONFIG_MQTT_TRANSPORT_SSL=y
+CONFIG_MQTT_TRANSPORT_WEBSOCKET=n
+CONFIG_MQTT_TASK_STACK_SIZE=6144
+CONFIG_MQTT_BUFFER_SIZE=2048
+CONFIG_ESP_TLS_INSECURE=y
+CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_SSL_MAX_CONTENT_LEN=8192
+
+# ---------------------------------------------------------------------------
+# 任务栈 / 运行时
+# ---------------------------------------------------------------------------
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=3072
+
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+# Info 级即可。调试引脚/离合时序时改成 Debug，但要注意 Debug 级会打印大量
+# 底层日志，反而把有用的行挤掉。
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_COLORS=y
+
+# 崩溃时把寄存器现场留下来，方便定位"接上负载就重启"
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+
+# ---------------------------------------------------------------------------
+# OTA
+# ---------------------------------------------------------------------------
+CONFIG_OTA_ALLOW_HTTP=y
+
+# 允许"新固件启动失败就自动回滚到上一版"。
+# ★ 前提是固件里必须调一次 esp_ota_mark_app_valid_cancel_rollback()，
+#   否则新版本每次重启都会被判为"未确认"，回滚两次后就被换回旧版。
+#   调用点在 main.c 里，条件是网页服务起得来（详见那里的注释）。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# 注：**没有** CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP。
+#   那个符号属于 esp_https_ota 组件（用于从 URL 拉固件），而本工程的 OTA 走的是
+#   底层 esp_ota_begin/write/end 三段式（网页直接 POST 固件体），根本不用那个组件。
+#   写上它只会换来一条 "unknown config item" 警告。

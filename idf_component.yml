@@ -1,0 +1,4 @@
+# ESP Component Manager 依赖清单
+# 构建时 idf.py 会自动从这里拉取外部组件
+dependencies:
+  espressif/mdns: "*"

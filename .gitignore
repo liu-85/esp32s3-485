@@ -1,0 +1,35 @@
+# ============================================================
+# ESP-IDF 构建产物 —— 都不进版本库
+# ============================================================
+
+# 整个构建目录（cmake 缓存、对象文件、生成的 sdkconfig、最终 bin）
+build/
+build-c3/
+build-s3/
+
+# sdkconfig 是 idf.py 由 sdkconfig.defaults **生成**的中间产物。
+#   ★ 有意改配置请改 sdkconfig.defaults（它才有版本管理），不要改 sdkconfig：
+#     下一次干净构建会被覆盖掉，而在别人机器上根本不存在。
+sdkconfig
+sdkconfig.old
+
+# 组件管理器
+managed_components/
+dependencies.lock
+
+# 交叉编译中间产物
+*.o
+*.obj
+*.a
+*.elf
+*.map
+
+# PyInstaller / 运行时生成物（tools/build_exe.py）
+tools/dist/
+tools/*.spec
+tools/esp_ams_tool.spec
+tools/后处理脚本该填什么.txt
+# 配置工具运行时生成的（主题偏好 / 界面里的「保存配置」）
+tools/ui_theme.txt
+tools/filament_settings.json
+tools/.esp_ams_last_dir

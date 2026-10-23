@@ -1,0 +1,52 @@
+# ===========================================================================
+# 换行符规则 —— 这不是风格问题，是有实际后果的
+# ===========================================================================
+# 背景（踩过一次，记在这里）：
+#   GitHub Actions 执行 run: 块的方式是 `bash -e <脚本文件>`。
+#   脚本里带 CRLF 时，第 1 行 `set -e` 实际是 `set -e\r`，bash 会报
+#
+#       line 1: set: -: invalid option
+#
+#   并以退出码 2 直接终止整个 step —— 编译根本走不到 ESP-IDF 那一步，
+#   而报错信息跟 idf.py 毫无关系，极难排查。
+#
+#   2026-09-21 就发生过一次：一次纯换行符提交把全部 51 个文件的 blob
+#   变成了 CRLF，CI 第一步即失败。所以这里把规则固化下来。
+#
+# 结论：**仓库里（blob）一律存 LF**。工作区想是 CRLF 无所谓，
+#       由 core.autocrlf 在检出时决定，不影响推送内容。
+# ===========================================================================
+
+# 默认交给 git 判断文本文件
+* text=auto
+
+# ---- 必须是 LF：会被 Linux 上的 shell / 工具链直接吃进去 ----
+*.yml            text eol=lf
+*.yaml           text eol=lf
+*.sh             text eol=lf
+*.py             text eol=lf
+*.c              text eol=lf
+*.h              text eol=lf
+*.csv            text eol=lf
+*.json           text eol=lf
+*.md             text eol=lf
+CMakeLists.txt   text eol=lf
+.gitignore       text eol=lf
+.gitattributes   text eol=lf
+
+# ---- Windows 专用脚本：保持 CRLF，cmd.exe 对 LF-only 的 .bat 有兼容问题 ----
+*.bat            text eol=crlf
+*.cmd            text eol=crlf
+
+# ---- 原样保留，不做任何转换 ----
+# G-code 样本是 BambuStudio 的真实输出，CRLF/LF 混用是它本来的样子，
+# 强行统一反而会让"拿它当证据"这件事失真。
+*.txt            -text
+# 二进制产物
+*.bin            -text
+*.pyc            -text
+*.png            -text
+*.jpg            -text
+*.elf            -text
+*.map            -text
+*.zip            -text
