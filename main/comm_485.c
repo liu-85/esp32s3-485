@@ -1157,48 +1157,32 @@ static void mot_apply(int ch)
 /* 打印机点名了某个槽 → 单通道状态机。返回 true = 状态变了 */
 static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_us)
 {
-    /* ★★ 2026-10-24 用户拍板：Cxx/Dxx 都进状态机 + 现场 flags 恒 0x01 ★★
+    /* ★★ 2026-10-24 0.29.2 收窄回 Tianshu 判据（修复 0.29.1 抖动）★★
      *
-     *   Tianshu（BambuBus.cpp:251~255）判据：
-     *       send_out       = (0x03, 0x00)
-     *       before_on_use  = (0x09, 0xA5)   （本固件曾扩展到 0x7F）
-     *       stop_on_use    = (0x07, 0x00)
-     *       on_use         = (0x07, 0x7F)
-     *       before_pullb   = (0x09, 0x3F)
+     *   0.29.0/0.29.1 为接现场 flags=0x01 把进料/退料放宽到 0x01，结果打印机
+     *   交替发的 idle 轮询帧（flags=0x01/0x02）被当成进料/退料意图 →
+     *   刚 send_out 就被退料收尾打回 idle，反复循环 → 「一会进一会退」。
      *
-     *   现场 /bus485raw 抓到的帧（A系列原始数据包 6-7 系列，Tianshu 实证退料
-     *   `0x09/0x3F` 帧之外，A1 打印机实际下发运动帧时 statu_flag 恒为 0x01）：
-     *       Cxx st=0x01 ch=0 motion=0x00 → 进料意图
-     *       Cxx st=0x01 ch=0 motion=0x3F → 退料意图
-     *   按 Tianshu 判据 flags=0x01 一条都接不住 → 状态机永停 MOT_IDLE →
-     *   我方回 use_flag=0x0F / pressure=0 / left_char=0xFF 的矛盾应答 →
-     *   打印机判「进料失败」→ 退回外挂 + 进退往复。
-     *
-     *   用户拍板「保持 Tianshu 判据」但现场 flags=0x01 必须也接住，否则电机
-     *   还是不动。故进料 / 退料两条主路径放宽为同时接受 0x01：
-     *     is_send_out      = flags==0x03 && motion==0x00   (Tianshu)
-     *                        || flags==0x01 && motion==0x00 (现场)
-     *     is_before_pullb  = flags==0x09 && motion==0x3F   (Tianshu)
-     *                        || flags==0x01 && motion==0x3F (现场)
-     *   before_on_use / on_use / stop_on_use 保持 Tianshu 判据（现场没抓到
-     *   这两条意图的 flags=0x01 帧，且 0x07 系有 5 秒闸门兜底，不影响主路径）。 */
-    const bool is_send_out      = ((flags == 0x03) || (flags == 0x01)) && (motion == 0x00);
+     *   现场设备 /log 实证：真正触发进料的是 flags=0x03（Tianshu 原值），
+     *   flags=0x01 是 idle 轮询、不该触发动作。所以：
+     *     · is_send_out / is_before_pullb 收窄回 Tianshu 判据（0x03 / 0x09）
+     *     · 退料收尾边沿（下面）同时接住 0x09 和 0x01 —— idle 轮询本身就是
+     *       "退料结束、回空闲"的信号，让它正确收尾而不是空转。 */
+    const bool is_send_out      = (flags == 0x03) && (motion == 0x00);
     const bool is_before_on_use = (flags == 0x09) && (motion == 0x7F || motion == 0xA5);
     const bool is_stop_on_use   = (flags == 0x07) && (motion == 0x00);
     const bool is_on_use        = (flags == 0x07) && (motion == 0x7F);
-    const bool is_before_pullb  = ((flags == 0x09) || (flags == 0x01)) && (motion == 0x3F);
+    const bool is_before_pullb  = (flags == 0x09) && (motion == 0x3F);
 
     const bool allow_any  = (s_now_mot_ch < 0) || (s_now_mot_ch == ch);
     const bool allow_stop = (s_now_mot_ch == ch);
     bool changed = false;
 
-    /* ★ 退料结束边沿：MOT_PULL_BACK 期间收到「没料」信号（flags=0x09 且
-     *   motion≠0x3F）→ 立即停电机、断离合、回空闲。
-     *   ★★ 2026-10-23 用户明确要求：删除退料尾拉 —— 补拉会跟打印机自己
-     *   收料动作打架，导致「进料退料循环」。退料实际长度由打印机
-     *   change_filament_gcode 决定。*/
+    /* ★ 退料结束边沿：MOT_PULL_BACK 期间收到「没料」信号 → 立即停、回空闲。
+     *   flags=0x09（Tianshu 的 before_pullb 系）或 0x01（现场 idle 轮询）都算
+     *   「退料结束」。motion≠0x3F 保证不跟 before_pullb(0x09/0x3F) 冲突。 */
     if (s_mot[ch] == MOT_PULL_BACK && !is_send_out &&
-        flags == 0x09 && motion != 0x3F) {
+        ((flags == 0x09) || (flags == 0x01)) && motion != 0x3F) {
         if (mot_set(ch, MOT_IDLE, now_us)) {
             if (config_get_485_actuate()) {
                 ams_post_stop();
@@ -1259,40 +1243,47 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
     return changed;
 }
 
-/* 槽号 = 0xFF（打印机没点名）→ 全局状态机 */
+/* 槽号 = 0xFF（打印机没点名）→ 全局状态机
+ *
+ * ★★ 2026-10-24 0.29.2 抖动修复 ★★
+ *
+ *   现场 0.29.1 实证（设备 /log 19:05~19:06 反复循环）：
+ *     flags=0x03 slot=1 → idle→进料(send_out) → do_485_drive 进料
+ *     flags=0x02 slot=1 → 进料→idle           → 收到停止指令（电机停）
+ *     flags=0x01 全局   → 进料→idle           → 收到停止指令
+ *     flags=0x03 slot=1 → idle→进料 ……        ← 一会进一会退
+ *
+ *   根因：0.29.1 为修"全局 idle 误触发"把 global 改成「任何非运动组合都推
+ *   所有通道回 idle」。结果打印机发的**非运动轮询帧**（flags=0x02/0x01
+ *   等）也被当成"停止进料"，刚送一点就被顶回 idle、电机停，下一帧 0x03
+ *   又送 → idle↔进料 快速翻转。
+ *
+ *   正确做法（恢复 Tianshu 的"默认保护"语义）：global 路径**只放行明确的
+ *   运动意图**（进料 0x03/0x00、退料 0x09 系+0x3F），其它组合一律**忽略、
+ *   保持当前状态**，绝不主动把所有通道推回 idle。这样：
+ *     · 真进料(0x03/0x00) → 当前通道转 send_out/pull_back
+ *     · 真退料(0x09/0x01 + 0x3F) → 当前通道转 before_pull_back
+ *     · 其它轮询(0x02/0x01 idle 等) → 什么都不做，通道状态不变 → 不抖动 */
 static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
 {
-    /* ★★ 2026-10-24 0.29.1 修正：全局 idle 轮询一律回 idle，绝不触发动作 ★★
-     *
-     *   现场 0.29.0 实证：选 AMS-A 后打印机**全程只发 slot=0xFF 的全局帧**
-     *   （flags=0x01 motion=0x00），从不点名 A1 通道。0.29.0 把 flags=0x01
-     *   放宽成进料判据后，这条全局 idle 轮询被当成"进料"接住 → 但全局
-     *   路径没有通道上下文，走的是"停机"分支 → 电机立刻被 ams_post_stop()
-     *   收掉 → 挤出机拉到一点没压力 → 报挤出失败。
-     *
-     *   现在：全局 0x01/0x00 = 纯 idle，一律让通道回 idle、断离合，**不触发
-     *   任何进料/退料动作**。真正的进料靠"点名槽"(slot < AMS_SLOTS) 的
-     *   0x01/0x00 放宽（见 mot_step_channel），那条路径有明确通道号才能驱动。
-     *   退料意图（0x09/0x01 + 0x3F）仍按 Tianshu/放宽判据接住。 */
-    if (flags == 0x01 && motion == 0x00) {
-        /* 全局空闲轮询：所有非运动通道回 idle，不动作 */
-        bool any = false;
-        for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
-            any = mot_set(i, MOT_IDLE, now_us) || any;
-        }
-        if (any) {
-            s_now_mot_ch = -1;
-            if (config_get_485_actuate()) {
-                ams_post_stop();
+    /* 进料（send_out）：Tianshu 判据 flags=0x03 && motion=0x00。
+     *   全局"进料但未点名"：若当前通道在 before_pull_back 或 stop_on_use，
+     *   就正式退料；否则不动作（等点名帧）。 */
+    if (flags == 0x03 && motion == 0x00) {
+        if (s_now_mot_ch >= 0 &&
+            (s_mot[s_now_mot_ch] == MOT_BEFORE_PULL_BACK ||
+             s_mot[s_now_mot_ch] == MOT_STOP_ON_USE)) {
+            int ch = (int)s_now_mot_ch;
+            if (mot_set(ch, MOT_PULL_BACK, now_us)) {
+                mot_apply(ch);
             }
         }
         return;
     }
 
-    /* ★ 退料（before_pull_back）：Tianshu 判据 flags=0x09 && motion=0x3F，
-     *   放宽现场 flags=0x01。点名退料走 channel 路径；全局退料（没点名）
-     *   只在当前通道 on_use 时转 before_pull_back。 */
-    if (((flags == 0x09) || (flags == 0x01)) && motion == 0x3F) {
+    /* 退料（before_pull_back）：Tianshu 判据 flags=0x09 && motion=0x3F。
+     *   当前通道在 on_use 时转 before_pull_back；其它不动作。 */
+    if (flags == 0x09 && motion == 0x3F) {
         if (s_now_mot_ch >= 0 && s_mot[s_now_mot_ch] == MOT_ON_USE) {
             int ch = (int)s_now_mot_ch;
             if (mot_set(ch, MOT_BEFORE_PULL_BACK, now_us)) {
@@ -1302,23 +1293,8 @@ static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
         return;
     }
 
-    /* 其它组合：当前通道正在 on_use 系时别动它（参考实现直接 return） */
-    if (s_now_mot_ch >= 0) {
-        uint8_t m = s_mot[s_now_mot_ch];
-        if (m == MOT_ON_USE || m == MOT_BEFORE_ON_USE || m == MOT_STOP_ON_USE) {
-            return;
-        }
-    }
-    bool any = false;
-    for (int i = 0; i < BOARD_CHANNEL_COUNT; i++) {
-        any = mot_set(i, MOT_IDLE, now_us) || any;
-    }
-    if (any) {
-        s_now_mot_ch = -1;
-        if (config_get_485_actuate()) {
-            ams_post_stop();
-        }
-    }
+    /* ★ 默认保护：其它任何组合（0x01/0x02 idle 轮询等）**一律忽略**，
+     *   保持当前通道状态不动 —— 这就是消除抖动的关键。绝不能在这推 idle。 */
 }
 
 static void handle_motion(const uint8_t *f, int len, bool short_frame,
