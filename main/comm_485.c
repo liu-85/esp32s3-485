@@ -1198,8 +1198,15 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
      *       "退料结束、回空闲"的信号，让它正确收尾而不是空转。 */
     const bool is_send_out      = (flags == 0x03) && (motion == 0x00);
     const bool is_before_on_use = (flags == 0x09) && (motion == 0x7F || motion == 0xA5);
-    const bool is_stop_on_use   = (flags == 0x07) && (motion == 0x00);
-    const bool is_on_use        = (flags == 0x07) && (motion == 0x7F);
+    /* ★ 0.29.6：现场这台 A1 到位后发的是 0x0F/0x0E（扩展位），不是 Tianshu 的
+     *   0x07/0x7F(on_use) 和 0x07/0x00(stop_on_use)。按扩展位对齐：
+     *   · on_use 扩展 = 0x0F/0x00（到位随动，电机停、让挤出机自己拉料）
+     *   · stop_on_use 扩展 = 0x0E/0xFF（到位停止，触发双微动决策开窗）
+     *   保留 0x07 原判据兜底（老协议/不同打印机仍可能发 0x07 系）。 */
+    const bool is_stop_on_use   = ((flags == 0x07) && (motion == 0x00)) ||
+                                   ((flags == 0x0E) && (motion == 0xFF));
+    const bool is_on_use        = ((flags == 0x07) && (motion == 0x7F)) ||
+                                   ((flags == 0x0F) && (motion == 0x00));
     const bool is_before_pullb  = (flags == 0x09) && (motion == 0x3F);
 
     const bool allow_any  = (s_now_mot_ch < 0) || (s_now_mot_ch == ch);
@@ -1506,7 +1513,8 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
      *   查询帧再也不会打断退料。
      */
     const int64_t now_us = esp_timer_get_time();
-    /* 明确运动意图：Cxx 里真正要驱动电机的 flags/motion 组合（Tianshu 判据） */
+    /* 明确运动意图：Cxx 里真正要驱动电机的 flags/motion 组合（Tianshu 判据 +
+     * 现场 0.29.5 实证补 0x0F/0x0E 扩展位） */
     const bool is_motion_intent =
         (cmd == 0x03) && (
             (flags == 0x03 && motion == 0x00) ||   /* send_out      进料 */
@@ -1514,7 +1522,14 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
             (flags == 0x07 && motion == 0x7F) ||   /* on_use        到位随动 */
             (flags == 0x07 && motion == 0x00) ||   /* stop_on_use   到位停止 */
             (flags == 0x09 && motion == 0x3F) ||   /* before_pullb  准备退料 */
-            (flags == 0x09 && motion == 0xFF) );   /* pull_back 收尾（退料结束/无料） */
+            (flags == 0x09 && motion == 0xFF) ||   /* pull_back 收尾（退料结束/无料） */
+            /* ★ 0.29.6：现场这台 A1 到位后发 0x0F/0x0E（Tianshu 判据表未覆盖的
+             *   扩展 flags，高位 bit4/bit3 置 1，通常是"自动模式/带传感器"
+             *   新协议标记）。0.29.5 按 Tianshu 收紧门控把它们挡在门外 →
+             *   到位后电机停在原位不继续挤 → 打印机自动挤出"没动静"。
+             *   现按 on_use(0x0F)/stop_on_use(0x0E) 扩展位补进白名单。 */
+            (flags == 0x0F && motion == 0x00) ||   /* on_use 扩展   到位随动 */
+            (flags == 0x0E && motion == 0xFF) );   /* stop_on_use 扩展 到位停止 */
     if (is_motion_intent && unit_ok) {
         int ch = (int)ru * AMS_SLOTS + (int)((slot < AMS_SLOTS) ? slot : 0);
         if (slot < AMS_SLOTS) {
