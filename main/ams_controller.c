@@ -246,8 +246,8 @@ static void poll_485_decide(void)
 
     /* 窗口超时 → 放弃决策，回到纯 idle */
     if (since >= AMS_485_DECIDE_TIMEOUT_MS) {
-        ams_log("485 决策：通道%d 到位后 %u ms 内微动无响应 → 断离合回空闲",
-                ch + 1, since);
+        ams_log("485 决策：通道%d 到位后 %lu ms 内微动无响应 → 断离合回空闲",
+                ch + 1, (unsigned long)since);
         s_485_decide_ch = -1;
         /* 超时收手：若离合还吸着（续送中断开）则统一断 */
         motor_stop();
