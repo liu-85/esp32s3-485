@@ -124,6 +124,12 @@ static uint32_t s_cnt_08;
 static uint32_t s_cnt_motion;
 static uint32_t s_cnt_other;
 
+/* ★ 退料定长上限（Tianshu PULLBACK_TIMEOUT 语义，0.29.3 修退料过多）
+ *   退料持续反转，退满这个时长就自停断离合，不再死等打印机「到位帧」。
+ *   Tianshu 默认 7s；现场退料长度由切片 change_filament_gcode 决定，
+ *   7s 足够把料退回料盘，不会顶过头。 */
+#define RETRACT_TIMEOUT_MS 7000
+
 /* ==========================================================================
  * 运动状态机（★ 2026-10-23 第十六轮新增）
  * ==========================================================================
@@ -160,6 +166,8 @@ enum {
 static uint8_t  s_mot[BOARD_CHANNEL_COUNT];  /* 每通道运动状态 */
 static int8_t   s_now_mot_ch = -1;           /* 当前占用通道；-1 = 无 */
 static uint32_t s_sendout_us[BOARD_CHANNEL_COUNT];
+/* ★ 退料定长上限（Tianshu PULLBACK_TIMEOUT 语义，见 0.29.3 修退料过多）★ */
+static uint32_t s_pullback_us[BOARD_CHANNEL_COUNT];
 /* 日志去重：只在"命令组合"变化时打一行（现场点一下进料就能看到唯一证据） */
 static uint8_t  s_noted_mot_ch = 0xFF;
 static uint8_t  s_noted_flags;
@@ -1071,6 +1079,9 @@ static bool mot_set(int ch, uint8_t new_mot, int64_t now_us)
     s_mot[ch] = new_mot;
     if (new_mot == MOT_SEND_OUT) {
         s_sendout_us[ch] = (uint32_t)(now_us / 1000);
+    } else if (new_mot == MOT_PULL_BACK) {
+        /* ★ 退料定长自停时间戳：每次转入 PULL_BACK 都重新记，退满上限即停 */
+        s_pullback_us[ch] = (uint32_t)(now_us / 1000);
     }
     return true;
 }
@@ -1111,10 +1122,27 @@ static void mot_apply(int ch)
         ams_post_stop();
         break;
     case MOT_PULL_BACK:
-        /* ★ 退料：反转持续退料，直到打印机发「停止」指令停。 */
+        /* ★★★ 退料：反转持续退料，加定长上限（Tianshu PULLBACK_TIMEOUT 语义）★★★
+         *
+         *   0.29.3 对齐 Tianshu AMCU.cpp 的 is_need_pull_back（454-477 行）：
+         *   退料是「定长超时自停」—— 持续反转，退够 RETRACT_TIMEOUT_MS（7s）
+         *   就自己停、回 waiting。退料长度由我方限定，**不靠打印机发「到位帧」**。
+         *
+         *   现场 0.29.2 退料过多的根因：MOT_PULL_BACK 持续反转但没定长上限，
+         *   只等"退料收尾帧（0x09/0x01 非 0x3F）"才停；而打印机发完退料帧后
+         *   **根本没发收尾帧**（日志里只有 04 01 01 00 03 FF 反复）→ 我方一直
+         *   反转 → 退太多。
+         *
+         *   现在：进入 PULL_BACK 时（mot_set）记 s_pullback_us[ch] 时间戳，
+         *   bus_task 每拍调 poll_485_retract() 检查——退满 RETRACT_TIMEOUT_MS
+         *   就 ams_post_stop() 自停断离合，不再等收尾帧。退料中途若打印机发了
+         *   新的运动意图（send_out / stop_on_use 等），状态机照常转态、时间戳
+         *   随状态变化重置。 */
         if (!ams_post_485_drive(ch, -1)) {
             ams_log_warn("485：通道%d 正忙，退料指令被丢弃", ch + 1);
         }
+        ams_log("485：通道%d 退料开始（定长 %dms 自停，不等收尾帧）",
+                ch + 1, RETRACT_TIMEOUT_MS);
         break;
     case MOT_BEFORE_PULL_BACK:
         /* ★★ 准备退料(before_pull_back 0x09/0x3F) → 反转退料，不是停电机 ★★
@@ -1295,6 +1323,44 @@ static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
 
     /* ★ 默认保护：其它任何组合（0x01/0x02 idle 轮询等）**一律忽略**，
      *   保持当前通道状态不动 —— 这就是消除抖动的关键。绝不能在这推 idle。 */
+}
+
+/* ==========================================================================
+ * ★ 退料定长自停（0.29.3，对照 Tianshu AMCU.cpp is_need_pull_back）★★★
+ *
+ *   Tianshu 的退料是「定长超时自停」：进入 pull_back 后持续反转，退够
+ *   PULLBACK_TIMEOUT（默认 7s）就自己停、回 waiting。退料长度由 AMS 自己
+ *   限定，**不靠打印机发「到位帧」**。
+ *
+ *   我方 0.29.2 的退料过多根因：MOT_PULL_BACK 持续反转但没有定长上限，
+ *   只在收到「退料收尾帧（0x09/0x01 且 motion≠0x3F）」时才停；而打印机
+ *   发完退料帧后**根本没发收尾帧**（日志里只有 0x09/0x3F 反复发）→ 我方
+ *   一直反转 → 退太多、报挤出失败。
+ *
+ *   修法：bus_task 每拍（~10ms）调 poll_485_retract()，把处于 MOT_PULL_BACK
+ *   的通道退满 RETRACT_TIMEOUT_MS（7s）就 ams_post_stop() 自停、断离合、
+ *   回 idle。退料中途若收到新的运动意图（send_out / stop_on_use 等），
+ *   状态机照常转态、时间戳随转态重置（mot_set 重新记时间戳）。
+ *   这样退料长度被"我方可控"地封顶，不再退过量。 */
+static void poll_485_retract(void)
+{
+    for (int ch = 0; ch < BOARD_CHANNEL_COUNT; ch++) {
+        if (s_mot[ch] != MOT_PULL_BACK) {
+            continue;
+        }
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t el = (uint32_t)(now_ms - s_pullback_us[ch]);
+        if (el >= RETRACT_TIMEOUT_MS) {
+            ams_log("485：通道%d 退料满 %dms 自停（定长上限，断离合）",
+                    ch + 1, RETRACT_TIMEOUT_MS);
+            if (mot_set(ch, MOT_IDLE, (int64_t)now_ms * 1000)) {
+                if (config_get_485_actuate()) {
+                    ams_post_stop();
+                }
+                s_now_mot_ch = -1;
+            }
+        }
+    }
 }
 
 static void handle_motion(const uint8_t *f, int len, bool short_frame,
@@ -1732,6 +1798,10 @@ static void bus_task(void *arg)
 
         int n = uart_read_bytes(COMM_485_UART_NUM, chunk, sizeof(chunk),
                                 pdMS_TO_TICKS(10));
+        /* ★ 退料定长自停：每拍（~10ms）检查所有 MOT_PULL_BACK 通道，
+         *   退满 RETRACT_TIMEOUT_MS 就自停断离合（对照 Tianshu 退料 7s 上限）。
+         *   放在 uart_read_bytes 之后，让收帧 + 检查在同一拍完成。 */
+        poll_485_retract();
         if (n <= 0) {
             continue;
         }
