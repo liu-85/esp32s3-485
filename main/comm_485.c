@@ -126,9 +126,9 @@ static uint32_t s_cnt_other;
 
 /* ★ 退料定长上限（Tianshu PULLBACK_TIMEOUT 语义，0.29.3 修退料过多）
  *   退料持续反转，退满这个时长就自停断离合，不再死等打印机「到位帧」。
- *   Tianshu 默认 7s；现场退料长度由切片 change_filament_gcode 决定，
- *   7s 足够把料退回料盘，不会顶过头。 */
-#define RETRACT_TIMEOUT_MS 7000
+ *   0.29.4 应用户要求把 7s 改成 4s：现场 4s 足够把料退回料盘且不会顶过头，
+ *   退料节拍更短、换料整体更快。若仍退不够（没退到位）可再调大。 */
+#define RETRACT_TIMEOUT_MS 4000
 
 /* ==========================================================================
  * 运动状态机（★ 2026-10-23 第十六轮新增）
@@ -1141,7 +1141,7 @@ static void mot_apply(int ch)
         if (!ams_post_485_drive(ch, -1)) {
             ams_log_warn("485：通道%d 正忙，退料指令被丢弃", ch + 1);
         }
-        ams_log("485：通道%d 退料开始（定长 %dms 自停，不等收尾帧）",
+        ams_log("485：通道%d 退料开始（定长 %dms 自停上限，idle 轮询不打断）",
                 ch + 1, RETRACT_TIMEOUT_MS);
         break;
     case MOT_BEFORE_PULL_BACK:
@@ -1206,11 +1206,21 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
     const bool allow_stop = (s_now_mot_ch == ch);
     bool changed = false;
 
-    /* ★ 退料结束边沿：MOT_PULL_BACK 期间收到「没料」信号 → 立即停、回空闲。
-     *   flags=0x09（Tianshu 的 before_pullb 系）或 0x01（现场 idle 轮询）都算
-     *   「退料结束」。motion≠0x3F 保证不跟 before_pullb(0x09/0x3F) 冲突。 */
+    /* ★ 退料结束边沿（0.29.4 收窄）：MOT_PULL_BACK 期间收到「没料」信号 →
+     *   立即停、回空闲。
+     *
+     *   判据从 0.29.2 的「flags==0x09 或 0x01（motion≠0x3F）」收窄为
+     *   「flags==0x09 && motion==0xFF」——只认 Tianshu 的「退料结束/没料」
+     *   收尾帧 (0x09/0xFF)。
+     *
+     *   ★ 根因（现场 0.29.3 实证，monitor 日志 20:40:01）：0.29.2/0.29.3 把
+     *   idle 轮询 (flags=0x01/0x02) 也算「退料结束」，导致 PULL_BACK 刚反转
+     *   退一点就被 0x01 打断 → 下一帧 0x03 又送 → 「反复进退料」。且打断
+     *   发生在 4s 定长自停 (poll_485_retract) 跑满之前，定长上限根本没机会
+     *   生效。改成只认 0x09/0xFF 收尾帧后，idle 轮询不再打断退料，退料能
+     *   跑满 RETRACT_TIMEOUT_MS(4s) 自停断离合。 */
     if (s_mot[ch] == MOT_PULL_BACK && !is_send_out &&
-        ((flags == 0x09) || (flags == 0x01)) && motion != 0x3F) {
+        (flags == 0x09) && (motion == 0xFF)) {
         if (mot_set(ch, MOT_IDLE, now_us)) {
             if (config_get_485_actuate()) {
                 ams_post_stop();
@@ -1338,10 +1348,14 @@ static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
  *   一直反转 → 退太多、报挤出失败。
  *
  *   修法：bus_task 每拍（~10ms）调 poll_485_retract()，把处于 MOT_PULL_BACK
- *   的通道退满 RETRACT_TIMEOUT_MS（7s）就 ams_post_stop() 自停、断离合、
- *   回 idle。退料中途若收到新的运动意图（send_out / stop_on_use 等），
- *   状态机照常转态、时间戳随转态重置（mot_set 重新记时间戳）。
- *   这样退料长度被"我方可控"地封顶，不再退过量。 */
+ *   的通道退满 RETRACT_TIMEOUT_MS（4s，0.29.4 应用户要求由 7s 改短）就
+ *   ams_post_stop() 自停、断离合、回 idle。退料中途若收到新的运动意图
+ *   （send_out / stop_on_use 等），状态机照常转态、时间戳随转态重置
+ *   （mot_set 重新记时间戳）。这样退料长度被"我方可控"地封顶，不再退过量。
+ *
+ *   ★ 0.29.4 关键补充：退料结束只认 0x09/0xFF 收尾帧，idle 轮询
+ *   (0x01/0x02) 不再打断退料（见 mot_step_channel 的退料结束边沿）。
+ *   否则 idle 帧会把 PULL_BACK 中途打回 idle，定长自停根本跑不满。 */
 static void poll_485_retract(void)
 {
     for (int ch = 0; ch < BOARD_CHANNEL_COUNT; ch++) {
