@@ -1381,18 +1381,24 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
     bool unit_ok = (unit < AMS_UNITS);
     uint8_t ru = unit_ok ? unit : 0;
 
-    /* ★ 每次命令组合变化都记一行：现场点「进料」时，这一行就是唯一证据 */
+    /* ★ 精简日志（2026-10-24）：打印机台1/台2 交替轮询，unit 每帧都变，
+     *   但 flags/motion/slot 在 idle 时恒不变。旧逻辑把 unit 也算进"变化"
+     *   判断，导致同样的 idle 帧（flags=0x01 motion=0x00 slot=0xFF）每帧都刷
+     *   一行，有用的真进料/退料信号（slot 变 0/1/2/3）反而被淹没。
+     *   现改为：**只看 flags/motion/slot 三者**，三者任一变化才打一行；
+     *   unit 仅作提示，不参与去重。 */
     if ((cmd == 0x03 || cmd == 0x04) &&
-        (unit != s_noted_mot_ch || flags != s_noted_flags ||
-         motion != s_noted_motion || slot != s_noted_slot)) {
+        (flags != s_noted_flags ||
+         motion != s_noted_motion ||
+         slot != s_noted_slot)) {
         s_noted_mot_ch = unit;
         s_noted_flags  = flags;
         s_noted_motion = motion;
         s_noted_slot   = slot;
-        ams_log("485 运动命令：台%d %s flags=0x%02X motion=0x%02X slot=%s",
-                (int)unit + 1, unit_ok ? "" : "(无此台)",
+        ams_log("485 运动命令：flags=0x%02X motion=0x%02X slot=%s（台%d%s）",
                 flags, motion,
-                (slot < AMS_SLOTS) ? "0123" + slot : "0xFF/其它");
+                (slot < AMS_SLOTS) ? "0123" + slot : "0xFF/全局",
+                (int)unit + 1, unit_ok ? "" : "(无此台)");
     }
 
     /* ---- 状态机：先更新状态，再照新状态组应答，最后才真正驱动电机 ---- */

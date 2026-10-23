@@ -20,8 +20,10 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
+      # ★★ 2026-10-24 用户拍板：只编译 S3，不再编 C3（C3 是 2 通道降级方案，
+      #   当前硬件全部是 8 通道 S3；C3 编译浪费 CI 时间且从不刷用到设备）。
       matrix:
-        target: [ esp32s3, esp32c3 ]
+        target: [ esp32s3 ]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -199,12 +201,6 @@ jobs:
           name: esp-ams-esp32s3-build
           path: dist_s3/
 
-      - name: Download C3 artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: esp-ams-esp32c3-build
-          path: dist_c3/
-
       - name: Create GitHub Release
         # 原为 softaction/touch-release@v1 —— 该 action 在 GitHub 上不存在（API 返回 404），
         # 一打 tag 这一步就必然失败。换成社区标准实现 softprops/action-gh-release。
@@ -215,11 +211,11 @@ jobs:
           name: "esp-ams ${{ github.ref_name }}"
           draft: false
           body: |
-            自动编译发布（双目标：ESP32-S3 + ESP32-C3）。
+            自动编译发布（仅 ESP32-S3 8 通道完整方案；C3 已于 2026-10-24 停用）。
 
             ---
 
-            ## ESP32-S3（4 通道完整方案）
+            ## ESP32-S3（8 通道完整方案）
 
             **固件文件**
             - `s3_merged.bin` — 合并固件（bootloader + 分区表 + 应用，一条命令刷入）
@@ -239,26 +235,6 @@ jobs:
 
             ---
 
-            ## ESP32-C3（2 通道降级方案）
-
-            > ⚠️ C3 版没有微动开关引脚，完全依赖 MQTT 事件 + 超时模式驱动。
-            > 挤出机到位信号也只走 MQTT（hw_switch_state）。
-
-            **固件文件**
-            - `c3_merged.bin` — 合并固件（bootloader + 分区表 + 应用）
-            - `firmware_esp32c3.bin` — 仅应用（OTA 升级用）
-            - `version_esp32c3.txt` — 编译元信息
-
-            **首次烧录（USB 口 / UART0）**
-            ```bash
-            esptool --chip esp32c3 --port COM5 --baud 460800 write_flash 0x0 c3_merged.bin
-            ```
-            > C3 模组通常通过 USB（CP2102 / CH340） 转 UART 烧录，波特率 460800 比较稳。
-
-            **OTA 升级**：设备 Web 端直接上传 `firmware_esp32c3.bin`。
-
-            ---
-
             ## 通用烧录说明
 
             1. **下载 esptool**（如果还没有）：`pip install esptool`
@@ -272,19 +248,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p upload
-          # 重命名成对目标友好的文件名
+          # 只挂 S3（C3 已停用）
           cp dist_s3/*_merged.bin upload/s3_merged.bin
           cp dist_s3/firmware_esp32s3.bin upload/
           cp dist_s3/version_esp32s3.txt upload/
-          cp dist_c3/*_merged.bin upload/c3_merged.bin
-          cp dist_c3/firmware_esp32c3.bin upload/
-          cp dist_c3/version_esp32c3.txt upload/
           ls -lh upload/
           gh release upload "${{ github.ref_name }}" \
             upload/s3_merged.bin \
             upload/firmware_esp32s3.bin \
             upload/version_esp32s3.txt \
-            upload/c3_merged.bin \
-            upload/firmware_esp32c3.bin \
-            upload/version_esp32c3.txt \
             --clobber
