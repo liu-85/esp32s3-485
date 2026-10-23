@@ -1305,8 +1305,15 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
 static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
 {
     /* 进料（send_out）：Tianshu 判据 flags=0x03 && motion=0x00。
-     *   全局"进料但未点名"：若当前通道在 before_pull_back 或 stop_on_use，
-     *   就正式退料；否则不动作（等点名帧）。 */
+     *   全局"进料但未点名"(slot=0xFF)：若当前通道在 before_pull_back 或
+     *   stop_on_use，就正式退料；否则不动作（等点名帧）。
+     *
+     *   ★ 0.29.5（用户第 3 条）：这里"从停止/准备态转 PULL_BACK 并反转"是
+     *   Tianshu 的正式退料语义（send_out 全局帧 + 当前已在退料侧 → 执行
+     *   pull_back）。但因 0.29.5 已收紧门控——只有 Cxx 携带明确运动意图的
+     *   帧才进状态机、Dxx 查询帧(0x01/0x00)不进——所以这条路径现在只在
+     *   "打印机真发 Cxx 0x03/0x00"时触发，查询帧不再误打。保留不动，
+     *   避免修完反复进退后变成"无法退料"（用户第 3 条的提醒）。 */
     if (flags == 0x03 && motion == 0x00) {
         if (s_now_mot_ch >= 0 &&
             (s_mot[s_now_mot_ch] == MOT_BEFORE_PULL_BACK ||
@@ -1479,9 +1486,36 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
      *   的相同字段不再产生 changed → 不会二次驱动电机。边界时刻字段不一致时
      *   由 5 秒闸门（on_use 在 send_out 未满 5s 不转）+ allow_stop 兜底。
      *   用户已确认采用"两者都进 + Cxx 判据"。
+     *
+     * ★★★ 2026-10-24 0.29.5 修正（用户指出的状态机冲突，对照 /bus485raw 实证）★★★
+     *
+     *   0.29.3 现场帧（复现"反复进退料"）证明 **Dxx(0x04) 会发查询帧
+     *   flags=0x01 / motion=0x00 / slot=0（状态查询）**，而 0.29.3 的
+     *   mot_step_channel 退料收尾边沿把 flags=0x01 误当「退料结束」→ 把
+     *   MOT_PULL_BACK 中途打回 idle → 打印机再发 0x03/0x00 又进 PULL_BACK
+     *   → 反复进退料。根因是「查询帧和运动指令混在一起进状态机」。
+     *
+     *   修法（用户第 1/2/3 条建议）：
+     *     ① 区分 Cxx / Dxx：只有 **Cxx(cmd=0x03) 携带明确运动意图的帧**
+     *        （进料 0x03/0x00、预送 0x09/0xA5、到位 0x07/0x7F、停 0x07/0x00、
+     *        准备退料 0x09/0x3F）才驱动状态机。
+     *     ② Dxx(0x04) **只走状态查询应答**（下面 cmd==0x04 分支），不进状态机。
+     *     ③ Cxx 的 idle 轮询帧（flags=0x01/0x02、motion=0x00）也不驱动 —— 它们
+     *        是打印机在没动作时的轮询，不是运动意图。
+     *   退料结束仍由 0x09/0xFF 收尾帧 + poll_485_retract() 的 4s 定长上限双保险，
+     *   查询帧再也不会打断退料。
      */
     const int64_t now_us = esp_timer_get_time();
-    if ((cmd == 0x03 || cmd == 0x04) && unit_ok) {
+    /* 明确运动意图：Cxx 里真正要驱动电机的 flags/motion 组合（Tianshu 判据） */
+    const bool is_motion_intent =
+        (cmd == 0x03) && (
+            (flags == 0x03 && motion == 0x00) ||   /* send_out      进料 */
+            (flags == 0x09 && motion == 0xA5) ||   /* before_on_use 预送 */
+            (flags == 0x07 && motion == 0x7F) ||   /* on_use        到位随动 */
+            (flags == 0x07 && motion == 0x00) ||   /* stop_on_use   到位停止 */
+            (flags == 0x09 && motion == 0x3F) ||   /* before_pullb  准备退料 */
+            (flags == 0x09 && motion == 0xFF) );   /* pull_back 收尾（退料结束/无料） */
+    if (is_motion_intent && unit_ok) {
         int ch = (int)ru * AMS_SLOTS + (int)((slot < AMS_SLOTS) ? slot : 0);
         if (slot < AMS_SLOTS) {
             mot_step_channel(ch, flags, motion, now_us);
@@ -1489,6 +1523,8 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
             mot_step_global(flags, motion, now_us);
         }
     }
+    /* ★ Dxx(cmd=0x04) 不驱动状态机：它下面只走应答（回 use_flag/pressure/left_char）。
+     *   0.29.3 反复进退料根因就是 Dxx 查询帧(0x01/0x00)进了状态机被误当退料结束。 */
 
     if (cmd == 0x04) {
         /* ---------- Dxx：60 字节，cmd 必须是 0x04 ---------- */
