@@ -1449,7 +1449,35 @@ static void mot_step_global(uint8_t flags, uint8_t motion, int64_t now_us)
         return;
     }
 
-    /* ★ 默认保护：其它任何组合（0x01/0x02 idle 轮询等）**一律忽略**，
+    /* ★★ 0.32.0：全局空闲帧(flags=0x01, slot=0xFF) —— 到位后必须回 idle ★★
+     *
+     *   对照 Tianshu send_for_Dxx：`read_num==0xFF && statu_flags==0x01`
+     *   分支会把当前通道 set_motion_internal(idle) 卸载。本固件 0.29.1 为防
+     *   "idle↔进料"抖动，把全局 0x01 一律忽略 —— 但也因此丢掉了**到位后
+     *   复位**的唯一途径：stop_on_use 之后没有任何代码把 s_mot 拉回 idle，
+     *   于是 use_flag 一直报 0x04(占用)、pressure 一直 0x2B00、left_char
+     *   一直 0b11(运动中)。打印机在到位后转为发全局 0x01 空闲轮询（现场
+     *   抓包证实它就是这么等待 AMS 就绪的），却读不到"AMS 已空闲/进料完成"，
+     *   便不进入挤出阶段，判送料未成功 → 退料重试 → 反复进退、第三次报
+     *   挤出失败。这正是"料已到位却就是不肯挤出"的根因。
+     *
+     *   折中（保留 0.29.1 防抖）：只在 stop_on_use(到位停止) 响应全局 0x01
+     *   回 idle；进料/退料途中(send_out/on_use/before_on_use/pull_back)仍
+     *   忽略。stop_on_use 与 idle 电机都是停，提前复位不改变机械动作，只把
+     *   上报状态切回"空闲"并释放占用，让打印机进入挤出。 */
+    if (flags == 0x01) {
+        if (s_now_mot_ch >= 0 && s_mot[s_now_mot_ch] == MOT_STOP_ON_USE) {
+            int ch = (int)s_now_mot_ch;
+            ams_log("485：通道%d 到位后收到全局空闲帧 → 回 idle（进料完成，交还挤出控制权）", ch + 1);
+            if (mot_set(ch, MOT_IDLE, now_us)) {
+                s_now_mot_ch = -1;   /* 释放占用 → loaded=0xFF，与 Tianshu 卸载语义一致 */
+                mot_apply(ch);       /* 停电机、断离合、回 IDLE */
+            }
+        }
+        return;
+    }
+
+    /* ★ 默认保护：其它任何组合（0x02 idle 轮询等）**一律忽略**，
      *   保持当前通道状态不动 —— 这就是消除抖动的关键。绝不能在这推 idle。 */
 }
 
