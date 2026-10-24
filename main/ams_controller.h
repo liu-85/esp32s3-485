@@ -244,6 +244,15 @@ void ams_485_enter_decide_window(int ch);
  */
 void ams_485_exit_decide_window(void);
 
+/**
+ * 标记决策窗口为「到位后窗口」（0.31.0）。
+ *
+ * on_use / before_on_use 期间的随动窗口不设 6s 超时（挤出机可能拉料很久），
+ * 只有 stop_on_use 到位后的窗口才检查超时。由 comm_485.c 的 mot_set() 在
+ * 转入 MOT_STOP_ON_USE 时调用。
+ */
+void ams_485_mark_decide_stop(void);
+
 /** 便捷封装：换料到指定打印机通道（1 起） */
 bool ams_post_exchange(int printer_channel);
 

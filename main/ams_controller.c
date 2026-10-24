@@ -221,9 +221,14 @@ static int      s_485_decide_ch    = -1;   /* 待决策通道；-1 = 无 */
 static uint32_t s_485_decide_us    = 0;    /* 进入决策窗口的时刻 */
 static uint32_t s_485_creek_us     = 0;    /* 上一次续送脉冲的起始时刻 */
 static uint32_t s_485_creep_end_ms = 0;    /* 续送脉冲预计结束时刻；0 = 未在续送 */
+static bool     s_485_decide_is_stop = false; /* true=到位后窗口(6s超时); false=随动窗口(不超时) */
 
 /**
- * 由 485 状态机在 stop_on_use 到位时调用（comm_485.c 在转 MOT_STOP_ON_USE 时调用）。
+ * 由 485 状态机在 on_use / before_on_use / stop_on_use 时调用
+ * （comm_485.c 的 mot_set 在转入这些状态时统一调用）。
+ *
+ * ★ 0.31.0：on_use/before_on_use 期间也开窗口（对照 Tianshu switchInterrupt），
+ *   但不设 6 秒超时（随动期间可能很长）。只有 stop_on_use 的窗口才超时。
  */
 void ams_485_enter_decide_window(int ch)
 {
@@ -231,6 +236,7 @@ void ams_485_enter_decide_window(int ch)
     s_485_decide_us    = (uint32_t)(esp_timer_get_time() / 1000);
     s_485_creek_us     = 0;
     s_485_creep_end_ms = 0;
+    s_485_decide_is_stop = false;   /* 默认随动窗口，不超时 */
 }
 
 /**
@@ -248,6 +254,14 @@ void ams_485_exit_decide_window(void)
 {
     s_485_decide_ch    = -1;
     s_485_creep_end_ms = 0;
+    s_485_decide_is_stop = false;
+}
+
+/** 由 comm_485.c 在进入 stop_on_use 时标记：到位后的窗口才设 6s 超时 */
+void ams_485_mark_decide_stop(void)
+{
+    s_485_decide_is_stop = true;
+    s_485_decide_us    = (uint32_t)(esp_timer_get_time() / 1000);
 }
 
 /** 485 决策层主循环（ams_task 每拍调用，全程非阻塞） */
@@ -264,10 +278,15 @@ static void poll_485_decide(void)
         int c = s_485_decide_ch;
         s_485_creep_end_ms = 0;
         motor_stop();
+        /* ★ 0.31.0：随动窗口续送后停止微动触发只停电机，不断离合、不关窗 */
         if (c >= 0 && sensor_triggered(c, SENSOR_STOP)) {
-            ams_log("485 决策：通道%d 续送后停止微动触发 → 收手断离合", c + 1);
-            s_485_decide_ch = -1;
-            clutch_release_all();
+            if (s_485_decide_is_stop) {
+                ams_log("485 决策：通道%d 续送后停止微动触发 → 收手断离合", c + 1);
+                s_485_decide_ch = -1;
+                clutch_release_all();
+            } else {
+                ams_log("485 决策：通道%d 续送后停止微动触发 → 停电机（随动中不关窗）", c + 1);
+            }
         }
         return;
     }
@@ -279,8 +298,11 @@ static void poll_485_decide(void)
 
     uint32_t since = now_ms - s_485_decide_us;
 
-    /* 窗口超时 → 放弃决策，回到纯 idle */
-    if (since >= AMS_485_DECIDE_TIMEOUT_MS) {
+    /* 窗口超时 → 放弃决策，回到纯 idle
+     * ★ 0.31.0：只有 stop_on_use 的到位窗口才检查 6s 超时。
+     *   on_use / before_on_use 的随动窗口不超时（挤出机可能拉料很久），
+     *   窗口的关闭由 mot_set 转态时调 exit_decide_window 完成。 */
+    if (s_485_decide_is_stop && since >= AMS_485_DECIDE_TIMEOUT_MS) {
         ams_log("485 决策：通道%d 到位后 %lu ms 内微动无响应 → 断离合回空闲",
                 ch + 1, (unsigned long)since);
         s_485_decide_ch = -1;
@@ -290,10 +312,17 @@ static void poll_485_decide(void)
         return;
     }
 
-    /* 1. 停止微动触发 → 料已咬稳，保持断料 */
+    /* 1. 停止微动触发 → 料已咬稳，保持断料
+     * ★ 0.31.0：随动窗口（on_use/before_on_use）期间不因停止微动而关窗，
+     *   因为挤出机还在拉料、状态随时会变。只有到位窗口（stop_on_use）
+     *   的停止微动触发才表示"料已到位咬稳"，可以关窗。
+     *   但随动窗口里停止微动触发时仍然停电机（不续送），只是不关窗。 */
     if (sensor_triggered(ch, SENSOR_STOP)) {
-        ams_log("485 决策：通道%d 停止微动触发 → 料已咬稳，保持断料", ch + 1);
-        s_485_decide_ch = -1;
+        if (s_485_decide_is_stop) {
+            ams_log("485 决策：通道%d 停止微动触发 → 料已咬稳，保持断料", ch + 1);
+            s_485_decide_ch = -1;
+        }
+        /* 随动期间：停止微动触发 = 料在位，不续送，等下一拍 */
         return;
     }
 

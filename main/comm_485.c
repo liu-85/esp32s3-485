@@ -1107,7 +1107,21 @@ static bool mot_set(int ch, uint8_t new_mot, int64_t now_us)
      *   否则打印机在到位后约 0.9 秒就发退料，而决策窗口有 6 秒 —— 退料
      *   期间 poll_485_decide 仍会正转续送，与退料方向互搏，表现为"到位后
      *   反复进退料"。这里只清窗口标志，电机由随后的 mot_apply 统一下令。 */
-    if (new_mot != MOT_STOP_ON_USE) {
+    /* ★ 0.31.0：进入 on_use / before_on_use / stop_on_use 时都开决策窗口。
+     *   对照 Tianshu AMCU.cpp：on_use/before_on_use/stop_on_use 都映射到
+     *   waiting 状态，AMCU_motion() 的 waiting 分支会调 switchInterrupt()
+     *   —— 微动触发时正转 200ms 补料。之前只在 stop_on_use 开窗口，导致
+     *   on_use 期间（挤出机在拉料）料被拉空后没有补料机制，挤出机拉不到
+     *   料就停 → 打印机判定送料失败 → 退料重试 → 无限循环。 */
+    if (new_mot == MOT_ON_USE || new_mot == MOT_BEFORE_ON_USE ||
+        new_mot == MOT_STOP_ON_USE) {
+        if (config_get_485_actuate()) {
+            ams_485_enter_decide_window(ch);
+            if (new_mot == MOT_STOP_ON_USE) {
+                ams_485_mark_decide_stop();  /* 到位窗口才设 6s 超时 */
+            }
+        }
+    } else {
         ams_485_exit_decide_window();
     }
     if (new_mot == MOT_SEND_OUT) {
@@ -1332,12 +1346,9 @@ static bool mot_step_channel(int ch, uint8_t flags, uint8_t motion, int64_t now_
         mot_meters_accum(ch, now_us);          /* 照搬 Tianshu：on_use 期间累计米数 */
     } else if (is_stop_on_use && allow_stop) {
         /* 到位停止：只从 on_use / before_on_use 转入（照搬 Tianshu）。
-         * 转入后触发本项目「双微动决策开窗」。 */
+         * 决策窗口已在 mot_set 中统一开启（0.31.0），不再重复调用。 */
         if (s_mot[ch] == MOT_ON_USE || s_mot[ch] == MOT_BEFORE_ON_USE) {
             changed = mot_set(ch, MOT_STOP_ON_USE, now_us);
-            if (changed && config_get_485_actuate()) {
-                ams_485_enter_decide_window(ch);
-            }
         }
     } else if (is_before_pullb && allow_stop) {
         if (s_mot[ch] == MOT_ON_USE || s_mot[ch] == MOT_BEFORE_ON_USE ||
