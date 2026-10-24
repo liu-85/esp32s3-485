@@ -1021,18 +1021,28 @@ static uint8_t mot_use_flag(int unit)
     return 0x00;
 }
 
-/* 压力值：Tianshu（唯一实测多台可用的参考）get_pressure_value() 的真值：
- *   send_out        0x4700
- *   before_on_use   0x4700   ★ 关键：prev==send_out 时报 0x4700（料还在挤出口、AMS 仍在推）
- *   on_use          0x2B00
- *   stop_on_use     0x2B00
- *   before_pull_back 0x2B00
- *   pull_back       0x4700
- *   idle            0xFFFF
+/* 压力值：Tianshu（唯一实测多台可用的参考）get_pressure_value() 的真值。
+ * 它的源码是：
+ *   send_out                    → 0x4700
+ *   before_on_use               → (prev_motion == send_out) ? 0x4700 : 0x2B00
+ *   on_use                      → 0x2B00
+ *   stop_on_use                 → (prev_motion == send_out) ? 0x4700 : 0x2B00
+ *   before_pull_back            → 0x2B00
+ *   pull_back                   → 0x4700
+ *   idle                        → 0xFFFF
+ * 其中 prev_motion 在函数开头被赋成 m 本身（`prev_motion = m`），恒等于当前态，
+ * 所以那两处三元表达式**永远走 0x2B00 分支**。即实机行为就是：
+ *   send_out/pull_back 推料中 → 0x4700；其余（含 before_on_use）→ 0x2B00。
  *
- * ★★ 0.25.0 的 bug：把 before_on_use 也归进 0x2B00，导致预送阶段打印机误以为
- *   「料已就位」→ 让挤出机正转拉料 → 但料实际还没送到（预送阶段仍在推）→ 空转
- *   → 判「挤出失败」→ 到位后 226ms 就发退料 → 报 0700-8003。 */
+ * ★★ 0.30.2 修正 ★★
+ *   0.25.0~0.30.1 把 before_on_use 也报成 0x4700（与 send_out 同值）是错的。
+ *   语义上 0x4700 = 「AMS 正在推料」、0x2B00 = 「料已就位/AMS 未推」；而本固件
+ *   在 before_on_use 阶段**已经停电机**（照 Tianshu 的 waiting 语义），却仍报
+ *   「正在推料」→ 打印机读到的是自相矛盾的状态，于是原地等压力下降（现场实测
+ *   before_on_use 卡了 15 秒），等到超时就直接判「挤出失败」→ 发退料 → 表现为
+ *   「挤出机只拉进一点就退料、如此循环」。
+ *   Tianshu 能用的组合是「before_on_use 停电机 + 报 0x2B00」，两者一致；这里补
+ *   上压力值这一半，电机侧（mot_apply）保持停止不动。 */
 static uint16_t mot_pressure(int ch)
 {
     if (ch < 0 || ch >= BOARD_CHANNEL_COUNT) {
@@ -1040,9 +1050,9 @@ static uint16_t mot_pressure(int ch)
     }
     switch (s_mot[ch]) {
     case MOT_SEND_OUT:
-    case MOT_BEFORE_ON_USE:      /* ★ 预送仍报 0x4700，同 send_out */
     case MOT_PULL_BACK:
-        return 0x4700;
+        return 0x4700;                 /* 正在推/拉料 */
+    case MOT_BEFORE_ON_USE:            /* ★ 预送已停电机 → 报「已就位」 */
     case MOT_ON_USE:
     case MOT_STOP_ON_USE:
     case MOT_BEFORE_PULL_BACK:
@@ -1531,8 +1541,21 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
      *   判断，导致同样的 idle 帧（flags=0x01 motion=0x00 slot=0xFF）每帧都刷
      *   一行，有用的真进料/退料信号（slot 变 0/1/2/3）反而被淹没。
      *   现改为：**只看 flags/motion/slot 三者**，三者任一变化才打一行；
-     *   unit 仅作提示，不参与去重。 */
-    if ((cmd == 0x03 || cmd == 0x04) &&
+     *   unit 仅作提示，不参与去重。
+     *
+     * ★ 0.30.2 再补一刀：光看三者还不够 —— 这台 A1 会**逐帧交替**发
+     *   「台内运动帧 0x03/0x00/slot0」与「全局空轮询帧 0x01/0x00/0xFF」，
+     *   于是三元组每帧都在变，"变化才打"形同虚设 → 每帧一行、约 17~20 行/秒，
+     *   而日志环形缓冲只有 48 行（≈2.5 秒）→ 轮询采集必然丢行，真正的状态
+     *   迁移（如 before_on_use→stop_on_use）全被冲掉，现场只看到"状态莫名跳变"。
+     *   现在：全局帧里**不带运动意图**的（既不是退料确认 0x03/0x00，也不是
+     *   准备退料 0x09/0x3F）直接不记、也不动去重游标 —— 这类帧本就不驱动任何
+     *   状态（见 mot_step_global 的默认保护），记它没有信息量。 */
+    const bool log_worthy = (slot < AMS_SLOTS) ||
+                            (flags == 0x03 && motion == 0x00) ||
+                            (flags == 0x09 && motion == 0x3F);
+
+    if ((cmd == 0x03 || cmd == 0x04) && log_worthy &&
         (flags != s_noted_flags ||
          motion != s_noted_motion ||
          slot != s_noted_slot)) {
@@ -1540,10 +1563,17 @@ static void handle_motion(const uint8_t *f, int len, bool short_frame,
         s_noted_flags  = flags;
         s_noted_motion = motion;
         s_noted_slot   = slot;
-        ams_log("485 运动命令：flags=0x%02X motion=0x%02X slot=%s（台%d%s）",
-                flags, motion,
-                (slot < AMS_SLOTS) ? "0123" + slot : "0xFF/全局",
-                (int)unit + 1, unit_ok ? "" : "(无此台)");
+        /* 旧写法 `(slot < AMS_SLOTS) ? "0123" + slot : "0xFF/全局"` 是拿字面量
+         * 做指针偏移：slot=0 打出的是整串 "0123"，看着像"4 个槽都在动"，
+         * 其实只表示槽 0 —— 调试时极易误判，这里改成直接打槽号。 */
+        if (slot < AMS_SLOTS) {
+            ams_log("485 运动命令：flags=0x%02X motion=0x%02X slot=%d（台%d%s）",
+                    flags, motion, (int)slot, (int)unit + 1,
+                    unit_ok ? "" : "(无此台)");
+        } else {
+            ams_log("485 运动命令：flags=0x%02X motion=0x%02X slot=0xFF/全局（台%d%s）",
+                    flags, motion, (int)unit + 1, unit_ok ? "" : "(无此台)");
+        }
     }
 
     /* ---- 状态机：先更新状态，再照新状态组应答，最后才真正驱动电机 ---- */
