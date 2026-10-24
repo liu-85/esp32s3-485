@@ -1,16 +1,14 @@
 # ===========================================================================
 # GitHub Actions —— ESP-AMS-S3 自动编译 + 发布（双目标 matrix）
 # ===========================================================================
-# 推送到 main / 打 tag 时自动编译两个目标：
-#   · esp32s3 —— 4 通道完整方案（默认）
-#   · esp32c3 —— 2 通道降级方案
-# 打 tag 时把两个目标的固件都发到 GitHub Releases。
+# 推送到 main / clean485 / 打 tag 时自动编译（clean485 是 485 直连开发分支）。
+# 打 tag 时把固件发到 GitHub Releases。
 
 name: Build & Release
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, clean485 ]
     tags: [ 'v*' ]
 
 jobs:
